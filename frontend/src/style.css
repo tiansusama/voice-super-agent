@@ -47,9 +47,10 @@ main {
   border-radius: 50%;
 }
 
-.voice-symbol i { width: 4px; height: 14px; border-radius: 4px; background: #bd8b4e; }
-.voice-symbol i:nth-child(2), .voice-symbol i:nth-child(4) { height: 24px; }
-.voice-symbol i:nth-child(3) { height: 34px; }
+.wave-symbol { display: flex; align-items: center; justify-content: center; gap: 4px; }
+.wave-symbol i { width: 4px; height: 12px; border-radius: 4px; background: #bd8b4e; }
+.wave-symbol i:nth-child(2), .wave-symbol i:nth-child(4) { height: 20px; }
+.wave-symbol i:nth-child(3) { height: 28px; }
 h1 { font-size: 26px; font-weight: 600; margin: 0 0 12px; }
 p { color: #8c8176; font-size: 14px; margin: 0 0 30px; }
 .startup-status { font-size: 13px; margin-bottom: 24px; overflow-wrap: anywhere; }
@@ -71,3 +72,21 @@ button:hover { background: #f5ead9; }
 button:focus-visible { outline: 2px solid #bd8b4e; outline-offset: 4px; }
 button:disabled { opacity: 0.5; cursor: default; }
 footer { color: #a99e92; font-size: 11px; margin-top: 28px; }
+.actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; }
+.error { color: #a44732; margin: 16px 0 0; }
+.desktop-check { width: min(100%, 480px); margin-top: 16px; padding: 20px; border: 1px solid #ede7df; border-radius: 20px; }
+.desktop-check h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.desktop-check p { margin-bottom: 12px; font-size: 12px; line-height: 1.7; }
+.check-status { margin-bottom: 16px; color: #8c8176; font-size: 12px; font-variant-numeric: tabular-nums; }
+.floating { overflow: hidden; }
+.floating-host { position: relative; width: 320px; height: 312px; }
+.floating-card { position: absolute; inset: 0 0 auto; height: 224px; border: 1px solid #ede7df; border-radius: 18px; background: #fffefd; overflow: hidden; }
+.floating-card header { height: 38px; padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: #a29383; }
+.floating-card header button { border: 0; background: transparent; padding: 2px 6px; font-size: 20px; }
+.floating-scroll { height: 146px; overflow-y: auto; padding: 0 14px; scrollbar-width: thin; scrollbar-color: #dbcebd transparent; }
+.floating-scroll p { font-size: 12px; line-height: 1.7; margin: 0 0 12px; }
+.preview-question { padding: 10px; border-radius: 12px; background: #faf0e3; color: #745537; }
+.preview-answer { padding: 8px 2px; }
+.open-main { display: block; margin: 4px auto; padding: 4px 12px; font-size: 11px; border-radius: 8px; }
+.floating-orb { position: absolute; left: 248px; top: 244px; width: 64px; height: 64px; border: 3px solid #dfbb8f; border-radius: 50%; padding: 0; background: #fff8ef; }
+.floating-error { position: absolute; inset: 40px 12px auto; background: #fffefd; color: #a44732; font-size: 12px; }

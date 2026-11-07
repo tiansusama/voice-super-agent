@@ -1,6 +1,8 @@
 # Voice Super Agent
 
-运行在 Windows 环境中的语音 Agent 项目，目前处于初始化阶段。
+运行在 Windows 环境中的语音 Agent 项目，已完成独立开发启动、单实例、托盘常驻、窗口管理和前后端状态桥接。模型对话与语音按实现计划继续接入。
+
+开发启动与窗口联调见 [开发运行](docs/development.md)，版本范围见 [V1.0.0 PRD](docs/prd/V1.0.0.md)，进度见 [实现计划](docs/plan/V1.0.0-implementation-plan.md)。
 
 ## 项目目标
 
