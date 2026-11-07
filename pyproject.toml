@@ -1,0 +1,20 @@
+[project]
+name = "voice-super-agent"
+version = "1.0.0.dev0"
+description = "运行于 Windows 的常驻语音 Agent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pipecat-ai",
+    "python-dotenv>=1.0,<2",
+    "pywebview==6.2.1",
+]
+
+[project.scripts]
+voice-super-agent = "voice_super_agent.app:main"
+
+[tool.uv.sources]
+pipecat-ai = { git = "https://github.com/pipecat-ai/pipecat.git", rev = "de8998789d5690073ddd1dafcec7268839af8153" }
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12"]
+build-backend = "uv_build"
