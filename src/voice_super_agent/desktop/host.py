@@ -34,6 +34,9 @@ class DesktopApi:
     def command(self, name: str) -> None:
         self._runtime.command(name)
 
+    def send_text(self, text: str):
+        return self._runtime.send_text(text)
+
 
 class Desktop:
     """管理窗口与托盘；独立发送线程承接阻塞的 WebView 脚本调用。"""

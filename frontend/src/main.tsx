@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
@@ -6,6 +6,11 @@ function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>();
   const [view, setView] = useState<DesktopConnection['view']>();
   const [error, setError] = useState('');
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const followLatest = useRef(true);
 
   useEffect(() => {
     let active = true;
@@ -48,6 +53,30 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (followLatest.current && messagesRef.current) {
+      messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
+    }
+  }, [snapshot]);
+
+  async function sendText() {
+    const text = draft.trim();
+    if (!text || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      await window.pywebview!.api.send_text(text);
+      setDraft(current => current === draft ? '' : current);
+      followLatest.current = true;
+      setError('');
+    } catch (reason) {
+      setError(`发送失败：${String(reason)}`);
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
+    }
+  }
+
   async function command(name: string) {
     try {
       await window.pywebview!.api.command(name);
@@ -88,19 +117,54 @@ function App() {
   }
 
   return (
-    <main>
-      <span className="eyebrow">VOICE SUPER AGENT</span>
-      <section className="startup-card">
-        <div className="voice-symbol">{symbol}</div>
-        <h1>你好，我是小博</h1>
-        <p>很高兴与你见面。</p>
-        <div className="startup-status" role="status" aria-live="polite">
-          <span className="status-dot ready" />桌面与后台已就绪
-        </div>
+    <main className="chat-page">
+      <header className="chat-header">
+        <div><span className="eyebrow">VOICE SUPER AGENT</span><h1>小博</h1></div>
         <div className="actions">
           <button onClick={() => void command('hide_main')}>隐藏到托盘</button>
           <button onClick={() => void command('quit')}>退出应用</button>
         </div>
+      </header>
+      <section className="chat-panel">
+        <div className="chat-status" role="status" aria-live="polite">
+          <span className={`status-dot ${state.model_available ? 'ready' : ''}`} />
+          {state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
+        </div>
+        {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
+        <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
+          onScroll={event => {
+            const element = event.currentTarget;
+            followLatest.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+          }}>
+          {snapshot.messages.length === 0 && <div className="chat-empty">
+            <div className="voice-symbol">{symbol}</div>
+            <h2>你好，我是小博</h2><p>有什么想聊的？</p>
+          </div>}
+          {snapshot.messages.map(message => <article className={`message ${message.role}`} key={message.id}
+            data-message-id={message.id} data-status={message.status}>
+            <div className="message-author">{message.role === 'user' ? '你' : '小博'}</div>
+            {message.text && <div className="message-text">{message.text}</div>}
+            {message.status === 'queued' && <span className="message-progress">等待处理…</span>}
+            {message.status === 'thinking' && <span className="message-progress">正在思考…</span>}
+            {message.status === 'streaming' && <span className="message-progress">正在回复…</span>}
+            {message.error && <p className="message-error" role="alert">{message.error}</p>}
+          </article>)}
+        </div>
+        <form className="composer" onSubmit={event => { event.preventDefault(); void sendText(); }}>
+          <label className="sr-only" htmlFor="message-input">输入消息</label>
+          <textarea id="message-input" placeholder="输入消息，Enter 发送，Shift + Enter 换行"
+            value={draft} disabled={!state.model_available} rows={2}
+            onChange={event => setDraft(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+                event.preventDefault();
+                if (state.model_available) void sendText();
+              }
+            }} />
+          <button type="submit" disabled={!state.model_available || !draft.trim() || sending}>
+            {sending ? '发送中…' : '发送'}
+          </button>
+        </form>
         {error && <p role="alert" className="error">{error}</p>}
       </section>
       {state.desktop_check && <section className="desktop-check">
@@ -114,7 +178,7 @@ function App() {
           <button onClick={() => void command('preview_floating')}>预览悬浮宿主</button>
         </div>
       </section>}
-      <footer>关闭窗口后，小博会继续在系统托盘中运行</footer>
+      <footer>关闭窗口后继续在托盘中运行 · 当前对话在本次运行期间保留</footer>
     </main>
   );
 }
