@@ -4,6 +4,7 @@ import gzip
 import json
 import sqlite3
 import struct
+import time
 from types import SimpleNamespace
 from websockets.exceptions import InvalidHandshake
 
@@ -12,7 +13,7 @@ from aiohttp import web
 from loguru import logger
 import pytest
 import pytest_asyncio
-from pipecat.frames.frames import StartFrame, InputAudioRawFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
+from pipecat.frames.frames import StartFrame, InputAudioRawFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame, TranscriptionFrame
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
@@ -64,6 +65,8 @@ class VoiceHarness:
         self.closed_audio = False
         self.classifications = []
         self.release_model = asyncio.Event()
+        self.release_classifier = asyncio.Event()
+        self.release_classifier.set()
         self.devices = AudioDevices(Endpoint("mic-1", "测试麦克风"), Endpoint("speaker-1", "测试播放"),
                                     frozenset({"mic-1", "speaker-1"}))
         self.audio_reopens = 0
@@ -94,6 +97,7 @@ class VoiceHarness:
 
     async def classify(self, request):
         self.classifications.append(await request.json())
+        await self.release_classifier.wait()
         return web.json_response({"answers": {"interruption_intent": {"choice": self.decision}}})
 
     async def synthesize(self, request):
@@ -151,6 +155,17 @@ class VoiceHarness:
         await self.wait(lambda s: s["state"]["voice_status"] == "active")
         self.output.audio.clear()
         self.runtime._loop.call_soon_threadsafe(self.output.release.clear)
+
+    async def pcm(self, data, *, epoch=None):
+        frame = InputAudioRawFrame(data, 16000, 1)
+        frame.metadata["voice_epoch"] = self.runtime._conversation._voice.boundary.epoch if epoch is None else epoch
+        await self.backend(self.input.push_audio_frame(frame))
+
+    async def resume_voice_input(self):
+        await self.wait(lambda s: self.asr_connections >= 2 and self.runtime._conversation._asr_resume_task.done())
+        for _ in range(30):
+            await self.pcm(bytes(640))
+        await self.wait(lambda s: not self.runtime._conversation._voice.boundary.wait_for_quiet)
 
 
 @pytest_asyncio.fixture
@@ -220,6 +235,7 @@ async def voice(tmp_path, monkeypatch, request):
         yield harness
     finally:
         harness.release_model.set()
+        harness.release_classifier.set()
         harness.asr_ready.set()
         await asyncio.to_thread(harness.runtime.stop)
         await server.cleanup()
@@ -267,8 +283,6 @@ async def test_confirmed_voice_interrupt_commits_old_reply_before_new_user(voice
 async def test_stopping_voice_and_text_continuation_restore_the_same_context(voice):
     await voice.transcript("请记住语音问题。")
     await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking")
-    with pytest.raises(ValueError, match="停止语音"):
-        voice.runtime.send_text("联调期间的文字")
     voice.release_audio()
     await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
     voice.runtime.command("stop_voice")
@@ -409,7 +423,7 @@ async def test_local_wake_waits_for_cloud_ready_and_ding_then_releases_input(voi
     assert voice.runtime._conversation._voice.stt._socket is None
     voice.asr_ready.clear()
     voice.detector.feed = lambda audio, rate: True
-    await voice.backend(voice.input.push_audio_frame(InputAudioRawFrame(b"\x01\x00" * 320, 16000, 1)))
+    await voice.pcm(b"\x01\x00" * 320)
     await voice.wait(lambda s: voice.asr_connections == 1)
     assert voice.runtime.connect("test")["state"]["voice_status"] == "starting"
     assert not voice.output.audio
@@ -642,3 +656,175 @@ async def test_audio_stream_failure_reports_unavailability_even_if_endpoint_is_s
     await voice.wait(lambda s: s["state"]["voice_status"] == "error")
     assert voice.closed_audio
     assert voice.runtime._conversation is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_text_replaces_uncommitted_voice_and_next_voice_uses_the_shared_context(voice):
+    await voice.wake()
+    conversation = voice.runtime._conversation
+    await voice.backend(conversation._user.queue_frame(VADUserStartedSpeakingFrame()))
+    await voice.transcript("这个问题还没说完。")
+    await voice.wait(lambda s: bool(s["messages"]))
+    assert not voice.requests
+    voice.runtime.send_text("改用文字问这个问题。")
+    snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert snapshot["state"]["voice_status"] == "active"
+    assert snapshot["messages"][0]["status"] == "unfinished"
+    assert snapshot["messages"][0]["text"] == "这个问题还没说完。"
+    assert snapshot["messages"][-1]["source"] == "text"
+    assert not voice.output.audio
+    users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+    assert users == ["改用文字问这个问题。"]
+    await voice.resume_voice_input()
+    await voice.transcript("现在用语音追问。")
+    voice.release_audio()
+    snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and s["messages"][-1]["source"] == "voice")
+    assert voice.output.audio
+    assert voice.runtime._conversation is conversation
+    users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+    assert users == ["改用文字问这个问题。", "现在用语音追问。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_old_transcripts_queued_after_asr_or_inside_aggregator_are_discarded(voice):
+    await voice.wake()
+    conversation = voice.runtime._conversation
+    old_epoch = conversation._voice.boundary.epoch
+    frames = [TranscriptionFrame("队列中的旧语音。", "u", ""), TranscriptionFrame("聚合器前的旧语音。", "u", "")]
+    for frame in frames:
+        frame.metadata["voice_epoch"] = old_epoch
+    voice.runtime.send_text("只回答这条文字。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    await voice.backend(conversation._voice.recognition_gate.queue_frame(frames[0]))
+    await voice.backend(conversation._user.queue_frame(frames[1]))
+    assert await voice.backend(conversation._worker.flush_pipeline())
+    assert len(voice.requests) == 1
+    assert [m["text"] for m in voice.runtime.connect("test")["messages"] if m["role"] == "user"] == ["只回答这条文字。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+@pytest.mark.parametrize("phase", ["generating", "speaking"])
+async def test_text_takes_over_a_voice_reply_and_preserves_committed_history(voice, phase, record_property):
+    await voice.wake()
+    await voice.transcript("等待模型。" if phase == "generating" else "请继续讲。")
+    await voice.wait(lambda s: bool(voice.requests) if phase == "generating" else s["state"]["voice_activity"] == "speaking")
+    before = len(voice.output.audio)
+    started = time.perf_counter()
+    voice.runtime.send_text("换成文字回答。")
+    await voice.wait(lambda s: voice.requests[-1]["messages"][-1]["content"] == "换成文字回答。")
+    record_property("local_text_takeover_ms", round((time.perf_counter() - started) * 1000, 2))
+    snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert snapshot["messages"][1]["status"] == "interrupted"
+    assert snapshot["messages"][-1]["source"] == "text"
+    assert snapshot["state"]["voice_status"] == "active"
+    assert len(voice.output.audio) == before
+    users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+    assert users[-1] == "换成文字回答。" and len(users) == 2
+    await voice.wait(lambda s: voice.runtime._conversation._asr_resume_task.done())
+    assert voice.runtime._lifecycle.should_end(voice.runtime._loop.time() + 120)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_consecutive_text_inputs_keep_their_order_while_voice_remains_active(voice):
+    await voice.wake()
+    voice.runtime.send_text("第一条文字。")
+    voice.runtime.send_text("第二条文字。")
+    voice.runtime.send_text("第三条文字。")
+    snapshot = await voice.wait(lambda s: len(voice.requests) >= 1 and s["messages"][-1]["status"] == "completed")
+    users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+    assert users == ["第一条文字。", "第二条文字。", "第三条文字。"]
+    assert snapshot["state"]["voice_status"] == "active"
+    assert not voice.output.audio
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_old_speech_tail_on_new_connection_waits_for_real_quiet_before_new_input(voice):
+    await voice.wake()
+    await voice.transcript("旧发言的开头", final=False)
+    await voice.wait(lambda s: bool(s["messages"]))
+    voice.runtime.send_text("改用这一条文字。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    await voice.wait(lambda s: voice.asr_connections == 2 and voice.runtime._conversation._asr_resume_task.done())
+    assert voice.runtime._conversation._voice.boundary.wait_for_quiet
+    await voice.transcript("旧发言的尾段。")
+    assert await voice.backend(voice.runtime._conversation._worker.flush_pipeline())
+    assert len(voice.requests) == 1
+    assert not any("尾段" in m["text"] for m in voice.runtime.connect("test")["messages"])
+    await voice.resume_voice_input()
+    await voice.transcript("停顿后的新问题。")
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and s["messages"][-1]["source"] == "voice")
+    assert len(voice.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_new_epoch_pcm_is_buffered_while_asr_reconnects_and_old_capture_is_discarded(voice):
+    await voice.wake()
+    old_epoch = voice.runtime._conversation._voice.boundary.epoch
+    voice.asr_ready.clear()
+    voice.runtime.send_text("先回答文字。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and voice.asr_connections == 2)
+    service = voice.runtime._conversation._voice.stt
+    await voice.pcm(b"\x22\x00" * 3200, epoch=old_epoch)
+    await voice.pcm(b"\x11\x00" * 3200)
+    await voice.wait(lambda s: len(service._audio) >= 6400)
+    assert bytes(service._audio) == b"\x11\x00" * 3200
+    assert not voice.runtime._lifecycle.should_end(voice.runtime._loop.time() + 120)
+    voice.asr_ready.set()
+    await voice.wait(lambda s: voice.runtime._conversation._asr_resume_task.done())
+    assert len(service._audio) == 0
+    assert voice.runtime.connect("test")["state"]["voice_status"] == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_text_takeover_cancels_pending_agent_end(voice):
+    await voice.wake()
+    await voice.transcript("结束语音。")
+    await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking" and voice.ending)
+    voice.runtime.send_text("先别结束，用文字继续。")
+    snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and s["messages"][-1]["source"] == "text")
+    assert snapshot["state"]["voice_status"] == "active"
+    assert voice.runtime._lifecycle.ending_reply is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_pending_system_one_candidate_is_cancelled_before_text_and_late_result_cannot_reopen_it(voice):
+    await voice.wake()
+    await voice.transcript("先讲这个问题。")
+    await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking")
+    voice.release_classifier.clear()
+    voice.decision = "interrupt"
+    await voice.transcript("尚未确认的旧接管。")
+    await voice.wait(lambda s: bool(voice.classifications))
+    voice.runtime.send_text("使用这条文字接管。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    voice.release_classifier.set()
+    assert await voice.backend(voice.runtime._conversation._worker.flush_pipeline())
+    assert len(voice.requests) == 2
+    assert voice.runtime._conversation._voice.interruption._candidate is None
+    assert not any("尚未确认" in m["text"] for m in voice.runtime.connect("test")["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_new_voice_takes_over_text_generation_and_restores_spoken_output(voice):
+    await voice.wake()
+    voice.runtime.send_text("等待模型。")
+    await voice.wait(lambda s: bool(voice.requests))
+    await voice.resume_voice_input()
+    await voice.transcript("用语音接管文字的问题。")
+    voice.release_audio()
+    snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and s["messages"][-1]["source"] == "voice")
+    assert snapshot["messages"][1]["source"] == "text"
+    assert snapshot["messages"][1]["status"] == "interrupted"
+    assert voice.output.audio
+    users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+    assert users == ["等待模型。", "用语音接管文字的问题。"]

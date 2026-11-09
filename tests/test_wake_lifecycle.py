@@ -5,6 +5,7 @@ from pipecat.tests.utils import run_test
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.voice.wake import WakeAudioGate, RecognitionGate
+from voice_super_agent.voice.input import VoiceInput
 
 
 def test_hold_requires_one_second_and_release_before_another_wake():
@@ -95,11 +96,14 @@ async def test_standby_pcm_only_reaches_kws_and_wake_fires_once():
             detected_audio.append((audio, rate))
             return True
 
-    gate = WakeAudioGate(events.append)
+    gate = WakeAudioGate(events.append, VoiceInput())
     gate.mode = "standby"
     gate.detector = Detector()
     pcm = b"\x01\x00" * 320
-    down, _ = await run_test(gate, frames_to_send=[InputAudioRawFrame(pcm, 16000, 1), InputAudioRawFrame(pcm, 16000, 1)])
+    frames = [InputAudioRawFrame(pcm, 16000, 1), InputAudioRawFrame(pcm, 16000, 1)]
+    for frame in frames:
+        frame.metadata["voice_epoch"] = 0
+    down, _ = await run_test(gate, frames_to_send=frames)
     assert events == [{"type": "wake"}]
     assert detected_audio == [(pcm, 16000)]
     assert [frame.audio for frame in down if isinstance(frame, InputAudioRawFrame)] == [bytes(640), bytes(640)]
@@ -107,10 +111,12 @@ async def test_standby_pcm_only_reaches_kws_and_wake_fires_once():
 
 @pytest.mark.asyncio
 async def test_active_pcm_passes_and_preparing_transcripts_are_discarded():
-    gate = WakeAudioGate(lambda event: None)
+    gate = WakeAudioGate(lambda event: None, VoiceInput())
     gate.mode = "active"
     pcm = b"\x01\x00" * 320
-    down, _ = await run_test(gate, frames_to_send=[InputAudioRawFrame(pcm, 16000, 1)])
+    frame = InputAudioRawFrame(pcm, 16000, 1)
+    frame.metadata["voice_epoch"] = 0
+    down, _ = await run_test(gate, frames_to_send=[frame])
     assert [frame.audio for frame in down if isinstance(frame, InputAudioRawFrame)] == [pcm]
     gate.mode = "paused"
     down, _ = await run_test(RecognitionGate(gate), frames_to_send=[TranscriptionFrame("旧识别", "u", "")])

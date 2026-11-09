@@ -42,7 +42,7 @@ async def test_stt_converts_provider_snapshots_and_publishes_each_final_once():
     service._socket = incoming()
     service.push_frame = AsyncMock()
     service.push_error = AsyncMock()
-    await service._receive_results()
+    await service._receive_results(service._socket, 0)
     frames = [call.args[0] for call in service.push_frame.call_args_list]
     assert [(type(frame), frame.text) for frame in frames] == [
         (InterimTranscriptionFrame, "你"),
@@ -64,6 +64,32 @@ async def test_stt_sends_pcm_in_provider_packets_without_ending_user_turns():
     assert packet[:4] == b"\x11\x21\x01\x00"
     assert struct.unpack_from(">i", packet, 4)[0] == 1
     assert gzip.decompress(packet[12:]) == b"\x01\x00" * 1600 + b"\x02\x00" * 1600
+
+
+@pytest.mark.asyncio
+async def test_old_asr_connection_cannot_retag_results_or_change_new_connection_deduplication():
+    def packet(text, end):
+        body = gzip.compress(json.dumps({"result": {"utterances": [
+            {"text": text, "end_time": end, "definite": True},
+        ]}}).encode())
+        return b"\x11\x90\x11\x00" + struct.pack(">I", len(body)) + body
+
+    async def incoming(text, end):
+        yield packet(text, end)
+
+    service = VolcengineSTTService(api_key="test-key")
+    old_socket = incoming("云端迟到的旧结果。", 9999)
+    service.input_epoch = 1
+    service._socket = incoming("新连接的结果。", 100)
+    service.push_frame = AsyncMock()
+    service.push_error = AsyncMock()
+    await service._receive_results(old_socket, 0)
+    service.push_frame.assert_not_awaited()
+    service.push_error.assert_not_awaited()
+    assert service._final_end_ms == -1
+    await service._receive_results(service._socket, 1)
+    frame = service.push_frame.call_args.args[0]
+    assert frame.text == "新连接的结果。" and frame.metadata["voice_epoch"] == 1
 
 
 class _Response:

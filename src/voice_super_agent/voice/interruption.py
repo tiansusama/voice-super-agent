@@ -81,7 +81,7 @@ class _ClassificationResultFrame(DataFrame):
 class SystemOneInterruptionProcessor(FrameProcessor):
     """Publish confirmed interruptions and native user backchannel frames."""
 
-    def __init__(self, *, api_key: str, session: aiohttp.ClientSession, context: LLMContext):
+    def __init__(self, *, api_key: str, session: aiohttp.ClientSession, context: LLMContext, input_boundary=None):
         """Initialize the overlap classifier.
 
         Args:
@@ -93,6 +93,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
         self._api_key = api_key
         self._session = session
         self._context = context
+        self._input_boundary = input_boundary
         self._bot_speaking = False
         self._user_turn_active = False
         self._candidate: _Candidate | None = None
@@ -103,6 +104,9 @@ class SystemOneInterruptionProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Keep audio flowing while overlapping transcripts await classification."""
         await super().process_frame(frame, direction)
+        if (self._input_boundary is not None and isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame))
+                and not self._input_boundary.accepts(frame)):
+            return
         if isinstance(frame, _ClassificationResultFrame):
             if frame.candidate is not self._candidate:
                 return
@@ -226,9 +230,13 @@ class SystemOneInterruptionProcessor(FrameProcessor):
             await self._call_event_handler("on_decision", candidate.text, candidate.decision)
             await self._discard_candidate()
             final = candidate.finals[-1]
-            await self.push_frame(
-                UserBackchannelFrame(candidate.text, final.user_id, final.timestamp)
-            )
+            backchannel = UserBackchannelFrame(candidate.text, final.user_id, final.timestamp)
+            backchannel.metadata.update(final.metadata)
+            await self.push_frame(backchannel)
+
+    async def reset_input(self):
+        await self._discard_candidate()
+        self._user_turn_active = False
 
     async def _discard_candidate(self) -> None:
         self._candidate = None

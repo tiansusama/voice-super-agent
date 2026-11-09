@@ -43,6 +43,7 @@ class DesktopAudioTransport(BaseTransport):
         self._mic_level = self._playback_level = 0.0
         self._level_time = 0.0
         self.devices = None
+        self.input_epoch = 0
 
     def input(self):
         return self._input
@@ -76,13 +77,15 @@ class DesktopAudioTransport(BaseTransport):
                                         stream_callback=self._render, start=False)
 
     def _capture(self, audio, count, times, status):
+        epoch = self.input_epoch
         try:
             if status:
                 raise OSError(f"录音设备回调异常，状态码 {status}")
             clean = self._echo.capture(audio, times["input_buffer_adc_time"])
             self._loop.call_soon_threadsafe(self._levels, audio_level(clean), None)
-            asyncio.run_coroutine_threadsafe(self._input.push_audio_frame(
-                InputAudioRawFrame(clean, RATE, 1)), self._loop)
+            frame = InputAudioRawFrame(clean, RATE, 1)
+            frame.metadata["voice_epoch"] = epoch
+            asyncio.run_coroutine_threadsafe(self._input.push_audio_frame(frame), self._loop)
             return None, pyaudio.paContinue
         except (OSError, ValueError, RuntimeError) as exc:
             asyncio.run_coroutine_threadsafe(self._input.push_error(

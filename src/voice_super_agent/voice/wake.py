@@ -73,12 +73,13 @@ class KeywordDetector:
 class WakeAudioGate(FrameProcessor):
     """待唤醒时原始 PCM 仅进入本地 KWS，后续轮次处理器收到静音以结束旧 VAD 状态。"""
 
-    def __init__(self, emit):
+    def __init__(self, emit, boundary):
         super().__init__()
         self.detector: KeywordDetector | None = None
         self.mode = "paused"
         self._emit = emit
         self._decode_lock = asyncio.Lock()
+        self.boundary = boundary
 
     async def reset_detector(self):
         if self.detector is not None:
@@ -87,6 +88,10 @@ class WakeAudioGate(FrameProcessor):
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            if frame.metadata["voice_epoch"] != self.boundary.epoch:
+                return
+            frame.metadata["voice_admitted"] = self.mode == "active"
         if isinstance(frame, InputAudioRawFrame) and self.mode != "active":
             if self.mode == "standby" and self.detector is not None:
                 async with self._decode_lock:
@@ -107,6 +112,8 @@ class RecognitionGate(FrameProcessor):
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
-        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)) and self._audio_gate.mode != "active":
-            return
+        if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            if (self._audio_gate.mode != "active" or not self._audio_gate.boundary.accepts(frame)
+                    or self._audio_gate.boundary.wait_for_quiet):
+                return
         await self.push_frame(frame, direction)

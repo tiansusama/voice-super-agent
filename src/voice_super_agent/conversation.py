@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from pipecat.frames.frames import (
     LLMContextFrame, LLMContextUserTurnFrame, LLMConfigureOutputFrame, TranscriptionFrame, UserBackchannelFrame,
     VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
     FunctionCallsStartedFrame, FunctionCallResultFrame, FunctionCallCancelFrame,
+    InputAudioRawFrame,
 )
 from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
 from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
@@ -22,7 +24,11 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
+    LLMAssistantAggregator,
 )
+from pipecat.audio.vad.vad_analyzer import VADState
+from websockets.exceptions import WebSocketException
+from voice_super_agent.voice.input import VoiceUserAggregator
 from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.turns.user_stop import UserTurnStoppedParams
@@ -31,6 +37,14 @@ from pipecat.workers.runner import WorkerRunner
 
 class TextDeepSeekService(DeepSeekLLMService):
     """模型请求失败直接反馈，由用户决定后续输入。"""
+
+    voice_input = None
+
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, LLMContextFrame) and frame.metadata.get("input_source") == "voice":
+            if self.voice_input.frozen or frame.metadata["voice_epoch"] != self.voice_input.epoch:
+                return
+        await super().process_frame(frame, direction)
 
     def create_client(self, api_key=None, base_url=None, **kwargs):
         try:
@@ -67,6 +81,8 @@ class Conversation:
         self._voice_pending: dict | None = None
         self._voice_finals = ""
         self._voice_interim = ""
+        self._generation_source = "text"
+        self._asr_resume_task: asyncio.Task | None = None
         self._response_has_tools = False
         self._voice_tools = ToolsSchema([FunctionSchema(
             name="end_voice", description="用户明确要求结束语音对话时调用。引用、讨论结束字样时继续交流。调用后可简短收尾，也可不回复正文。",
@@ -85,13 +101,15 @@ class Conversation:
             from voice_super_agent.voice.pipeline import VoicePipeline
 
             self._voice = VoicePipeline(self.context, emit)
-        self._user, assistant = LLMContextAggregatorPair(
-            self.context,
-            user_params=self._voice.user_params if voice else LLMUserAggregatorParams(
+            self._llm.voice_input = self._voice.boundary
+            self._user = VoiceUserAggregator(self.context, params=self._voice.user_params,
+                                             boundary=self._voice.boundary, on_quiet=self._input_quiet)
+            assistant = LLMAssistantAggregator(self.context, _paired_user_aggregator=self._user)
+        else:
+            self._user, assistant = LLMContextAggregatorPair(self.context, user_params=LLMUserAggregatorParams(
                 user_turn_strategies=ExternalUserTurnStrategies(),
                 empty_user_turn=None,
-            ),
-        )
+            ))
         processors = self._voice.processors(self._user, self._llm, assistant) if voice else [self._user, self._llm, assistant]
         self._worker = PipelineWorker(
             Pipeline(processors),
@@ -134,11 +152,17 @@ class Conversation:
         async def on_model_input(service, frame):
             if isinstance(frame, LLMContextFrame):
                 self._generation_reply_id = frame.metadata["reply_id"]
+                self._generation_source = frame.metadata.get("input_source", self._generation_source)
 
         @self._user.event_handler("on_before_process_frame")
         async def on_user_frame(aggregator, frame):
             if not self.voice_enabled:
                 return
+            if self._voice.boundary.frozen and not isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+                return
+            if isinstance(frame, (InputAudioRawFrame, TranscriptionFrame, InterimTranscriptionFrame, UserBackchannelFrame)):
+                if not self._voice.boundary.accepts(frame):
+                    return
             self._observe_voice_frame(frame)
             if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
                 if not frame.text.strip() and self._voice_pending is None:
@@ -164,7 +188,7 @@ class Conversation:
 
         @self._user.event_handler("on_before_push_frame")
         async def on_user_commit(aggregator, frame):
-            if self.voice_enabled:
+            if self.voice_enabled and not self._voice.boundary.frozen:
                 self._observe_voice_frame(frame)
             if self.voice_enabled and self._voice_pending is not None:
                 if isinstance(frame, LLMContextUserTurnFrame) and not frame.speculation:
@@ -185,6 +209,8 @@ class Conversation:
                             "messages": deepcopy(self.context.get_messages())})
                 self._voice_pending = None
                 self._voice_finals = self._voice_interim = ""
+                self.context.set_tools(self._voice_tools)
+                await self._user.push_frame(LLMConfigureOutputFrame(skip_tts=False))
             if isinstance(frame, LLMContextFrame):
                 # 原生取消和新输入可并行传播；回复关联随帧穿过生成与播放队列。
                 frame.metadata["reply_id"] = self._reply_id
@@ -253,6 +279,8 @@ class Conversation:
             @self._voice.stt.event_handler("on_before_push_frame")
             async def on_recognition(service, frame):
                 if isinstance(frame, (InterimTranscriptionFrame, TranscriptionFrame)) and frame.text:
+                    if not self._voice.boundary.accepts(frame):
+                        return
                     self._emit({"type": "voice_activity", "activity": "classifying" if self._voice.interruption._bot_speaking else "recognizing"})
 
     async def start(self) -> None:
@@ -277,7 +305,8 @@ class Conversation:
                 self._voice.playback_stopped()
 
     async def _end_voice(self, params):
-        if self._voice.gate.mode == "active" and self._generation_reply_id == self._reply_id:
+        if (self._voice.gate.mode == "active" and not self._voice.boundary.frozen
+                and self._generation_source == "voice" and self._generation_reply_id == self._reply_id):
             self._emit({"type": "end_requested", "reply_id": self._generation_reply_id})
             await params.result_callback({"status": "本轮回复和实际播报完成后结束语音，可简短收尾。"})
         else:
@@ -290,6 +319,7 @@ class Conversation:
         if not await self._worker.flush_pipeline():
             raise RuntimeError("唤醒前原生提交超时。")
         self.context.set_tools(self._voice_tools)
+        self._voice.stt.send_paused = False
         await self._worker.queue_frame(LLMConfigureOutputFrame(skip_tts=False))
         await self._voice.stt.connect()
         tone = asyncio.create_task(self._voice.play_ready_tone())
@@ -307,6 +337,8 @@ class Conversation:
     async def standby_voice(self):
         """按钮或超时通过原生取消和轮次结束保留上下文，设备及 worker 继续存续。"""
         self._voice.gate.mode = "paused"
+        await self._stop_asr_resume()
+        self._voice.boundary.frozen = self._voice.boundary.wait_for_quiet = False
         self._interrupted = True
         await self._user.broadcast_interruption()
         await self._voice.stt.disconnect()
@@ -341,6 +373,7 @@ class Conversation:
         try:
             await self._runner.run()
         finally:
+            await self._stop_asr_resume()
             if self._voice is not None:
                 await self._voice.close()
             if not self._closing:
@@ -359,12 +392,63 @@ class Conversation:
             waiter.cancel()
             await asyncio.gather(waiter, return_exceptions=True)
 
-    async def send(self, reply_id: str, text: str) -> None:
+    def begin_text_takeover(self):
+        """接收文字时立即划定采集边界，异步队列中的旧识别继续携带原代次。"""
+        boundary = self._voice.boundary
+        boundary.wait_for_quiet |= (self._voice_pending is not None
+                                    or self._voice.interruption._candidate is not None
+                                    or self._voice.user_params.vad_analyzer._vad_state != VADState.QUIET)
+        epoch = boundary.advance()
+        self._voice.transport.input_epoch = self._voice.stt.input_epoch = epoch
+        self._voice.stt.send_paused = True
+        self._busy("text_handoff", True)
+        return epoch
+
+    def _input_quiet(self):
+        if not self._voice.boundary.frozen:
+            self._voice.stt.send_paused = False
+        self._busy("input_tail", False)
+
+    async def _stop_asr_resume(self):
+        if self._asr_resume_task is not None:
+            self._asr_resume_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._asr_resume_task
+            self._asr_resume_task = None
+
+    async def _resume_asr(self):
+        self._busy("recognition_setup", True)
+        try:
+            await self._voice.stt.connect(keep_buffer=True)
+        except (OSError, RuntimeError, ValueError, TimeoutError, WebSocketException) as exc:
+            await self._voice.stt.push_error(error_msg=f"文字接管后恢复识别失败：{exc}",
+                                             exception=exc, force_treat_as_permanent=True)
+        finally:
+            self._busy("recognition_setup", False)
+
+    async def send(self, reply_id: str, text: str, *, voice_epoch=None) -> None:
         """按 STS 的打断、提交、追加顺序处理；仅等待本地轮次启动。"""
         self._interrupted = True
+        active_voice = self.voice_enabled and self._voice.gate.mode == "active"
+        if active_voice:
+            if voice_epoch is None:
+                voice_epoch = self.begin_text_takeover()
+            await self._stop_asr_resume()
+            await self._voice.stt.disconnect()
+            await self._voice.interruption.reset_input()
         await self._user.broadcast_interruption()
         if not await self._worker.flush_pipeline():
             raise RuntimeError("旧回复提交超时，请重启应用后继续。")
+        if active_voice:
+            await self._user.discard_voice()
+            if self._voice_pending is not None:
+                self._emit({"type": "voice_superseded", **self._voice_pending,
+                            "text": self._voice_finals + self._voice_interim})
+                self._voice_pending = None
+                self._voice_finals = self._voice_interim = ""
+            self._emit({"type": "voice_input_reset"})
+        if self.voice_enabled:
+            self.context.set_tools([])
         self._reply_id = reply_id
         self._interrupted = False
         self._failed = False
@@ -377,10 +461,18 @@ class Conversation:
         ))
         # 等到原生开始事件后再接下一条输入，保证连续文字均已进入上下文。
         await self._wait_until(self._started)
+        if active_voice and voice_epoch == self._voice.boundary.epoch:
+            self._voice.stt._opening = True
+            self._voice.boundary.frozen = False
+            self._voice.stt.send_paused = self._voice.boundary.wait_for_quiet
+            self._busy("input_tail", self._voice.boundary.wait_for_quiet)
+            self._asr_resume_task = asyncio.create_task(self._resume_asr(), name="resume-asr-after-text")
+            self._busy("text_handoff", False)
 
     async def close(self) -> None:
         self._closing = True
         self._interrupted = True
+        await self._stop_asr_resume()
         if self._runner_task is not None:
             await self._runner.cancel()
             await self._runner_task

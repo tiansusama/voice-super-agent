@@ -89,7 +89,8 @@ function App() {
   if (!snapshot || !view) return <main><p role="status">{error || '正在连接桌面…'}</p></main>;
   const state = snapshot.state;
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
-  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceBusy;
+  const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
+  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceSwitching;
   const voiceLabel = {off: '语音未启动', standby: '待唤醒', starting: '正在准备', active: '语音交互中', stopping: '正在结束', error: '语音不可用'}[state.voice_status];
   const activityLabel = {listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管', thinking: '正在思考', speaking: '正在播报'}[state.voice_activity];
   const symbol = <span className="wave-symbol" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
@@ -133,7 +134,7 @@ function App() {
         <div className="chat-status" role="status" aria-live="polite">
           <span className={`status-dot ${canSend ? 'ready' : ''}`} />
           {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
-            voiceBusy ? '语音交互中 · 结束语音后可发送文字' :
+            voiceSwitching ? '语音正在切换…' :
             state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
         </div>
         <div className="voice-controls">
@@ -159,7 +160,8 @@ function App() {
             <div className="voice-symbol">{symbol}</div>
             <h2>你好，我是小博</h2><p>有什么想聊的？</p>
           </div>}
-          {snapshot.messages.map(message => <article className={`message ${message.role}`} key={message.id}
+          {snapshot.messages.filter(message => !(message.role === 'assistant' && message.status === 'unfinished' && !message.text))
+            .map(message => <article className={`message ${message.role}`} key={message.id}
             data-message-id={message.id} data-status={message.status}>
             <div className="message-author">{message.role === 'user' ? '你' : '小博'}</div>
             {message.text && <div className="message-text">{message.text}</div>}

@@ -45,7 +45,7 @@ class Runtime:
         self._idle_task: asyncio.Task | None = None
         self._device_task: asyncio.Task | None = None
         self._execution_lock = asyncio.Lock()
-        self._inputs: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._inputs: asyncio.Queue[tuple[str, str, int | None]] = asyncio.Queue()
         self._input_task: asyncio.Task | None = None
         self._api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         self._base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
@@ -156,8 +156,12 @@ class Runtime:
             raise ValueError("正在保存并退出，请等待。")
         if not self._state["model_available"]:
             raise ValueError(self._state["model_error"])
-        if self._state["voice_status"] in {"starting", "active", "stopping"}:
-            raise ValueError("语音联调期间请先停止语音，再发送文字。")
+        if self._state["voice_status"] in {"starting", "stopping"}:
+            raise ValueError("语音正在切换，请稍后发送文字。")
+        epoch = None
+        if self._state["voice_status"] == "active":
+            self._lifecycle.new_input()
+            epoch = self._conversation.begin_text_takeover()
         user_id, reply_id = uuid4().hex, uuid4().hex
         timestamp = datetime.now(timezone.utc).isoformat()
         self._messages[user_id] = {
@@ -169,7 +173,7 @@ class Runtime:
             "text": "", "status": "queued", "created_at": timestamp, "error": "",
         }
         self._user_ids[reply_id] = user_id
-        self._inputs.put_nowait((reply_id, text))
+        self._inputs.put_nowait((reply_id, text, epoch))
         self._request_save(immediate=True)
         self._update({})
         if self._input_task is None:
@@ -180,7 +184,7 @@ class Runtime:
         """串行提交输入，模型生成继续由原生流水线异步执行。"""
         try:
             while True:
-                reply_id, text = await self._inputs.get()
+                reply_id, text, epoch = await self._inputs.get()
                 async with self._execution_lock:
                     if self._conversation is not None and self._conversation._runner_task.done():
                         await self._conversation.close()
@@ -188,7 +192,7 @@ class Runtime:
                     if self._conversation is None:
                         self._conversation = self._create_conversation(voice=False)
                         await self._conversation.start()
-                    await self._conversation.send(reply_id, text)
+                    await self._conversation.send(reply_id, text, voice_epoch=epoch)
         except (RuntimeError, TimeoutError, ValueError) as exc:
             logger.exception("文字输入处理失败")
             self._conversation_event({"type": "unavailable", "error": str(exc)})
@@ -358,6 +362,17 @@ class Runtime:
                                   "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
 
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "voice_input_reset":
+            for activity in ("input", "capture", "recognition", "user_turn", "input_tail"):
+                self._lifecycle.activity(activity, False, self._loop.time())
+            return
+        if event["type"] == "voice_superseded":
+            self._messages[event["user_id"]].update(text=event["text"], status="unfinished")
+            self._messages[event["reply_id"]]["status"] = "unfinished"
+            self._lifecycle.activity(f"reply:{event['reply_id']}", False, self._loop.time())
+            self._request_save(immediate=True)
+            self._update({})
+            return
         if event["type"] == "audio_levels":
             self._update({"microphone_level": event["microphone"], "playback_level": event["playback"]})
             return

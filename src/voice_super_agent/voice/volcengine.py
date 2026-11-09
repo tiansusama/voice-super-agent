@@ -53,6 +53,9 @@ class VolcengineSTTService(STTService):
         self._final_end_ms = -1
         self._interim_text = ""
         self._ready = asyncio.Event()
+        self.input_epoch = 0
+        self.send_paused = False
+        self._opening = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """准备处理器；常驻语音宿主在唤醒时建立云端连接。"""
@@ -60,10 +63,12 @@ class VolcengineSTTService(STTService):
         if not self._defer_connection:
             await self.connect()
 
-    async def connect(self):
+    async def connect(self, *, keep_buffer=False):
+        self._opening = True
         self._ready.clear()
         self._sequence = 1
-        self._audio.clear()
+        if not keep_buffer:
+            self._audio.clear()
         self._final_end_ms = -1
         self._interim_text = ""
         self._socket = await connect(
@@ -96,7 +101,7 @@ class VolcengineSTTService(STTService):
                 }
             ).encode(),
         )
-        self._receive_task = self.create_task(self._receive_results(), name="volcengine-stt")
+        self._receive_task = self.create_task(self._receive_results(self._socket, self.input_epoch), name="volcengine-stt")
         ready = asyncio.create_task(self._ready.wait())
         try:
             async with asyncio.timeout(10):
@@ -107,6 +112,8 @@ class VolcengineSTTService(STTService):
         finally:
             ready.cancel()
             await asyncio.gather(ready, return_exceptions=True)
+        self._opening = False
+        await self._flush_audio()
 
     async def _send_packet(self, message_type: int, payload: bytes):
         compressed = gzip.compress(payload)
@@ -119,19 +126,30 @@ class VolcengineSTTService(STTService):
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Send PCM while the receive task publishes transcripts."""
-        if self._socket is None:
+        if self.send_paused or (self._socket is None and not self._opening):
             yield None
             return
         self._audio.extend(audio)
+        if not self._opening:
+            await self._flush_audio()
+        yield None
+
+    async def process_audio_frame(self, frame, direction):
+        if (frame.metadata["voice_epoch"] == self.input_epoch
+                and (not self._opening or frame.metadata["voice_admitted"])):
+            await super().process_audio_frame(frame, direction)
+
+    async def _flush_audio(self):
         # 火山建议每包发送 200 毫秒，Pipecat 负责输入音频重采样。
         while len(self._audio) >= 6400:
             await self._send_packet(2, bytes(self._audio[:6400]))
             del self._audio[:6400]
-        yield None
 
-    async def _receive_results(self):
+    async def _receive_results(self, socket, epoch):
         try:
-            async for packet in self._socket:
+            async for packet in socket:
+                if epoch != self.input_epoch:
+                    continue
                 offset = (packet[0] & 0x0F) * 4
                 message_type = packet[1] >> 4
                 flags = packet[1] & 0x0F
@@ -149,7 +167,8 @@ class VolcengineSTTService(STTService):
                 response = json.loads(payload)
                 if response.get("code", 0) not in (0, 20000000):
                     raise RuntimeError(f"Volcengine ASR returned error code {response['code']}")
-                self._ready.set()
+                if epoch == self.input_epoch:
+                    self._ready.set()
                 result = response.get("result", {})
                 interim = []
                 # definite 只表示识别分句定稿；用户轮次由 Pipecat 的策略决定。
@@ -159,29 +178,32 @@ class VolcengineSTTService(STTService):
                         if utterance["end_time"] > self._final_end_ms:
                             self._final_end_ms = utterance["end_time"]
                             if text:
-                                await self.push_frame(
-                                    TranscriptionFrame(
-                                        text, self._user_id, time_now_iso8601(), Language.ZH
-                                    )
-                                )
+                                frame = TranscriptionFrame(text, self._user_id, time_now_iso8601(), Language.ZH)
+                                frame.metadata["voice_epoch"] = epoch
+                                await self.push_frame(frame)
                     else:
                         interim.append(text)
                 text = "".join(interim)
                 if text != self._interim_text:
                     self._interim_text = text
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            text, self._user_id, time_now_iso8601(), Language.ZH
-                        )
-                    )
-                await self._call_event_handler("on_recognition", bool(text))
-            raise RuntimeError("Volcengine ASR connection ended")
+                    frame = InterimTranscriptionFrame(text, self._user_id, time_now_iso8601(), Language.ZH)
+                    frame.metadata["voice_epoch"] = epoch
+                    await self.push_frame(frame)
+                if epoch == self.input_epoch:
+                    await self._call_event_handler("on_recognition", bool(text))
+            if epoch == self.input_epoch:
+                raise RuntimeError("Volcengine ASR connection ended")
         except (WebSocketException, OSError, RuntimeError, json.JSONDecodeError) as exc:
+            if epoch != self.input_epoch:
+                return
             await self.push_error(
                 error_msg=str(exc), exception=exc, force_treat_as_permanent=True
             )
 
     async def disconnect(self):
+        self._opening = False
+        self._ready.clear()
+        self._audio.clear()
         if self._receive_task is not None:
             await self.cancel_task(self._receive_task)
             self._receive_task = None

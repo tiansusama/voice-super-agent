@@ -14,6 +14,7 @@ from voice_super_agent.voice.interruption import SystemOneInterruptionProcessor
 from voice_super_agent.voice.volcengine import VolcengineSTTService, VolcengineTTSService
 from voice_super_agent.voice.wake import WakeAudioGate, RecognitionGate
 from voice_super_agent.audio.transport import DesktopAudioTransport
+from voice_super_agent.voice.input import VoiceInput
 from pipecat.frames.frames import TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame
 
 
@@ -21,7 +22,8 @@ class VoicePipeline:
     """持有一轮语音执行的本地设备与 HTTP 会话，帧处理保持 STS 原有顺序。"""
 
     def __init__(self, context, emit):
-        self.gate = WakeAudioGate(emit)
+        self.boundary = VoiceInput()
+        self.gate = WakeAudioGate(emit, self.boundary)
         self.recognition_gate = RecognitionGate(self.gate)
         self._tone_done: asyncio.Event | None = None
         self.user_params = LLMUserAggregatorParams(
@@ -36,7 +38,7 @@ class VoicePipeline:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         self.stt = VolcengineSTTService(api_key=os.environ["VOLCENGINE_API_KEY"], defer_connection=True)
         self.interruption = SystemOneInterruptionProcessor(
-            api_key=os.environ["ARK_API_KEY"], session=self._session, context=context,
+            api_key=os.environ["ARK_API_KEY"], session=self._session, context=context, input_boundary=self.boundary,
         )
         self.tts = VolcengineTTSService(api_key=os.environ["VOLCENGINE_API_KEY"], session=self._session)
 
