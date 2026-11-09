@@ -1,15 +1,19 @@
 import asyncio
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from httpx2 import InvalidURL
 from openai import AsyncOpenAI
 from pipecat.frames.frames import (
     CancelFrame, InterruptionFrame, LLMFullResponseEndFrame,
     LLMFullResponseStartFrame, LLMTextFrame, LLMMessagesAppendFrame,
+    BotStartedSpeakingFrame, BotStoppedSpeakingFrame, InterimTranscriptionFrame,
+    LLMContextFrame, LLMContextUserTurnFrame, LLMConfigureOutputFrame, TranscriptionFrame, UserBackchannelFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineWorker, ProcessorUnusablePolicy
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -21,7 +25,7 @@ from pipecat.workers.runner import WorkerRunner
 
 
 class TextDeepSeekService(DeepSeekLLMService):
-    """文字请求失败直接反馈，由用户决定后续输入。"""
+    """模型请求失败直接反馈，由用户决定后续输入。"""
 
     def create_client(self, api_key=None, base_url=None, **kwargs):
         try:
@@ -34,38 +38,52 @@ class TextDeepSeekService(DeepSeekLLMService):
         await self._client.close()
 
 
-class TextConversation:
+class Conversation:
     """原生聚合器独占模型上下文，展示事件绑定当前回复。"""
 
     def __init__(self, api_key: str, model: str, base_url: str, emit: Callable[[dict], None],
-                 messages: list[dict] | None = None):
+                 messages: list[dict] | None = None, voice: bool = False):
         self.context = LLMContext(messages=messages)
         self._emit = emit
         self._reply_id: str | None = None
         self._interrupted = False
         self._failed = False
+        self._failure_reason = ""
         self._reply_open = False
         self._closing = False
         self._ready = asyncio.Event()
         self._started = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
-        self._user, assistant = LLMContextAggregatorPair(
-            self.context,
-            user_params=LLMUserAggregatorParams(
-                user_turn_strategies=ExternalUserTurnStrategies(),
-                empty_user_turn=None,
-            ),
-        )
+        self.voice_enabled = voice
+        self._unavailable_hint = "语音对话已停止，请检查服务或设备后重新启动语音。" if voice else "文字对话已停止，请检查模型配置后重启应用。"
+        self._voice = None
+        self._voice_pending: dict | None = None
+        self._voice_finals = ""
+        self._voice_interim = ""
         self._llm = TextDeepSeekService(
             api_key=api_key,
             base_url=base_url,
             settings=DeepSeekLLMService.Settings(
                 model=model,
-                system_instruction="你是小博，一个友好的中文助手。请结合对话上下文，用清晰自然的中文回答。",
+                system_instruction=("你是小博，一个友好的中文助手。请结合对话上下文，用清晰自然的中文回答。"
+                                    + ("回答会直接朗读，请使用适合口语的表达，每次一到三句话。" if voice else "")),
             ),
         )
+        if voice:
+            from voice_super_agent.voice.pipeline import VoicePipeline
+
+            self._voice = VoicePipeline(self.context)
+        self._user, assistant = LLMContextAggregatorPair(
+            self.context,
+            user_params=self._voice.user_params if voice else LLMUserAggregatorParams(
+                user_turn_strategies=ExternalUserTurnStrategies(),
+                empty_user_turn=None,
+            ),
+        )
+        processors = self._voice.processors(self._user, self._llm, assistant) if voice else [self._user, self._llm, assistant]
         self._worker = PipelineWorker(
-            Pipeline([self._user, self._llm, assistant]),
+            Pipeline(processors),
+            params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=24000),
             enable_rtvi=False,
             enable_turn_tracking=False,
             idle_timeout_secs=None,
@@ -79,8 +97,62 @@ class TextConversation:
 
         @assistant.event_handler("on_before_process_frame")
         async def on_frame(aggregator, frame):
-            if isinstance(frame, LLMTextFrame):
+            if isinstance(frame, LLMTextFrame) and not self.voice_enabled:
                 self._emit({"type": "text", "reply_id": self._reply_id, "text": frame.text})
+
+        @self._llm.event_handler("on_before_push_frame")
+        async def on_generated(service, frame):
+            # 语音展示采用模型原文，原生助手聚合器仍在播放路径末端提交实际文本。
+            if self.voice_enabled and isinstance(frame, LLMTextFrame):
+                self._emit({"type": "text", "reply_id": self._reply_id, "text": frame.text})
+
+        @self._user.event_handler("on_before_process_frame")
+        async def on_user_frame(aggregator, frame):
+            if not self.voice_enabled:
+                return
+            if isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+                if not frame.text.strip() and self._voice_pending is None:
+                    return
+                if self._voice_pending is None:
+                    # 放行的新语音将开启原生接管，取消时产生的结束帧也属于旧回复。
+                    self._interrupted = True
+                    self._voice_pending = {"user_id": uuid4().hex, "reply_id": uuid4().hex,
+                                           "created_at": datetime.now(timezone.utc).isoformat()}
+                if isinstance(frame, TranscriptionFrame):
+                    self._voice_finals += frame.text
+                    self._voice_interim = ""
+                else:
+                    self._voice_interim = frame.text
+                self._emit({"type": "voice_input", **self._voice_pending,
+                            "text": self._voice_finals + self._voice_interim})
+            elif isinstance(frame, UserBackchannelFrame):
+                self._emit({"type": "backchannel", "user_id": uuid4().hex,
+                            "reply_id": self._reply_id, "text": frame.text,
+                            "created_at": datetime.now(timezone.utc).isoformat()})
+            elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
+                self._emit({"type": "voice_activity", "activity": "speaking" if isinstance(frame, BotStartedSpeakingFrame) else "listening"})
+
+        @self._user.event_handler("on_before_push_frame")
+        async def on_user_commit(aggregator, frame):
+            if self.voice_enabled and self._voice_pending is not None:
+                if isinstance(frame, LLMContextUserTurnFrame) and not frame.speculation:
+                    event_type = "voice_committed"
+                    text = frame.text
+                elif isinstance(frame, LLMContextFrame):
+                    # 空轮次恢复只发模型上下文；保留已识别片段及未完成状态。
+                    event_type = "voice_unfinished"
+                    text = self._voice_finals + self._voice_interim
+                else:
+                    return
+                pending = self._voice_pending
+                self._reply_id = pending["reply_id"]
+                self._interrupted = False
+                self._failed = False
+                self._failure_reason = ""
+                self._emit({"type": event_type, **pending, "text": text,
+                            "messages": deepcopy(self.context.get_messages())})
+                self._voice_pending = None
+                self._voice_finals = self._voice_interim = ""
 
         @assistant.event_handler("on_after_process_frame")
         async def on_processed(aggregator, frame):
@@ -101,14 +173,36 @@ class TextConversation:
         @self._llm.event_handler("on_error")
         async def on_model_error(service, error):
             self._failed = True
+            self._failure_reason = f"模型请求失败：{error.error}"
             self._emit({"type": "error", "reply_id": self._reply_id,
-                        "error": f"模型请求失败：{error.error}"})
+                        "error": self._failure_reason})
 
         @self._worker.event_handler("on_pipeline_error")
         async def on_pipeline_error(worker, error):
             if error.processor is not self._llm:
-                self._emit({"type": "error", "reply_id": self._reply_id,
+                self._failed = True
+                self._emit({"type": "voice_error" if self.voice_enabled else "error", "reply_id": self._reply_id,
                             "error": f"对话处理失败：{error.error}"})
+
+        if voice:
+            async def on_voice_error(processor, error):
+                self._failed = True
+                self._failure_reason = f"语音处理失败：{error.error}"
+                self._emit({"type": "voice_error", "reply_id": self._reply_id, "error": self._failure_reason})
+
+            # setup 阶段的错误也在处理器自身同步采集，保留原始设备或连接原因。
+            for processor in processors:
+                if processor is not self._llm:
+                    processor.add_event_handler("on_error", on_voice_error)
+
+            @self._voice.interruption.event_handler("on_decision")
+            async def on_decision(processor, text, decision):
+                self._emit({"type": "voice_activity", "activity": "speaking" if decision == "backchannel" else "recognizing"})
+
+            @self._voice.stt.event_handler("on_before_push_frame")
+            async def on_recognition(service, frame):
+                if isinstance(frame, (InterimTranscriptionFrame, TranscriptionFrame)) and frame.text:
+                    self._emit({"type": "voice_activity", "activity": "classifying" if self._voice.interruption._bot_speaking else "recognizing"})
 
     async def start(self) -> None:
         await self._runner.add_workers(self._worker)
@@ -119,8 +213,11 @@ class TextConversation:
         try:
             await self._runner.run()
         finally:
+            if self._voice is not None:
+                await self._voice.close()
             if not self._closing:
-                self._emit({"type": "unavailable", "error": "文字对话已停止，请检查模型配置后重启应用。"})
+                self._emit({"type": "unavailable", "voice": self.voice_enabled,
+                            "error": f"{self._failure_reason} {self._unavailable_hint}".strip()})
 
     async def _wait_until(self, event: asyncio.Event) -> None:
         """等待本地流水线信号，同时传播执行对象的结束与异常。"""
@@ -129,7 +226,7 @@ class TextConversation:
             done, _ = await asyncio.wait((waiter, self._runner_task), return_when=asyncio.FIRST_COMPLETED)
             if self._runner_task in done:
                 await self._runner_task
-                raise RuntimeError("文字对话已停止，请检查模型配置后重启应用。")
+                raise RuntimeError(f"{self._failure_reason} {self._unavailable_hint}".strip())
         finally:
             waiter.cancel()
             await asyncio.gather(waiter, return_exceptions=True)
@@ -143,8 +240,10 @@ class TextConversation:
         self._reply_id = reply_id
         self._interrupted = False
         self._failed = False
+        self._failure_reason = ""
         self._started.clear()
         self._emit({"type": "started", "reply_id": reply_id})
+        await self._worker.queue_frame(LLMConfigureOutputFrame(skip_tts=True))
         await self._worker.queue_frame(LLMMessagesAppendFrame(
             messages=[{"role": "user", "content": text}], run_llm=True,
         ))

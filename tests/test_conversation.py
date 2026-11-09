@@ -12,7 +12,7 @@ from aiohttp import web
 from loguru import logger
 from pipecat.frames.frames import LLMContextFrame
 
-from voice_super_agent.conversation import TextConversation
+from voice_super_agent.conversation import Conversation as TextConversation
 from voice_super_agent.runtime import Runtime
 from voice_super_agent.memory.store import ConversationStore
 
@@ -253,7 +253,7 @@ class PersistenceTests(ConversationFixture, unittest.IsolatedAsyncioTestCase):
 
                 return conversation
 
-            with patch("voice_super_agent.runtime.TextConversation", side_effect=blocked_conversation):
+            with patch("voice_super_agent.runtime.Conversation", side_effect=blocked_conversation):
                 runtime = self.runtime(path)
                 try:
                     runtime.send_text("first")

@@ -16,16 +16,19 @@ interface DesktopSnapshot {
     storage_status: 'saving' | 'saved' | 'error';
     storage_error: string;
     exiting: boolean;
+    voice_status: 'off' | 'starting' | 'active' | 'stopping' | 'error';
+    voice_activity: 'listening' | 'recognizing' | 'classifying' | 'thinking' | 'speaking';
+    voice_error: string;
   };
 }
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
-  source: 'text';
+  source: 'text' | 'voice';
   reply_id: string;
   text: string;
-  status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed' | 'unfinished';
+  status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed' | 'unfinished' | 'backchannel';
   created_at: string;
   error: string;
 }

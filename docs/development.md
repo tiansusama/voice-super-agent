@@ -1,6 +1,6 @@
 # 开发运行
 
-当前已完成阶段 04：在 DeepSeek 流式文字对话、连续追问与文字接管的基础上，加入 SQLite 对话保存、原生上下文恢复、退出前保存和保存失败反馈。独立工程、单实例、托盘常驻和悬浮宿主沿用阶段 02。保存与真实模型重启验收见 [阶段 04 验证记录](verification/stage-04.md)。页面启动和读取已保存记录无需模型凭据，发送文字需要配置 DeepSeek。
+当前已实现语音开发联调入口：在流式文字对话与 SQLite 保存恢复基础上，加入火山 ASR、System One、原生语音轮次、火山 TTS 和本地音频。实现与自动化验证已完成，耳机及真实云服务联调待验收，结果见 [语音链路计划及记录](plan/V1.0.0/05-sts-voice.md)。页面启动和读取已保存记录无需模型凭据，发送文字需要配置 DeepSeek。
 
 在已准备好的项目根目录启动桌面：
 
@@ -28,9 +28,13 @@ npm --prefix frontend ci
 
 Pipecat 依赖声明来自官方 Git 仓库，使用 STS 对应提交 `de8998789d5690073ddd1dafcec7268839af8153`。第一次安装需要 Git 与网络，uv 会把源码放入自己的缓存并安装到本项目 `.venv`。所需版本由 `uv.lock` 记录，运行不使用旁边 STS 的源码或 `.venv`。
 
+本地音频使用 Pipecat 的 `local` 依赖组及 PyAudio，Windows 所需分发包由 uv 安装。Silero VAD 和 Smart Turn 使用锁定依赖自带的模型资源。
+
 前端由 `frontend/package-lock.json` 记录确切依赖。阶段 01 无需额外准备语音模型，依赖包自带资源随依赖安装；后续独立模型资源约定见 [资源说明](../resources/README.md)。
 
 将 `.env.example` 复制为 `.env`，填写 `DEEPSEEK_API_KEY` 即可启用文字请求。已有 `.env` 时直接补充字段。模型默认 `deepseek-flash`，地址默认 `https://api.deepseek.com/v1`，可通过 `DEEPSEEK_MODEL` 和 `DEEPSEEK_BASE_URL` 设置，修改后重启应用生效。文字模式只使用 DeepSeek，不需要语音服务凭据或麦克风。唤醒词、组合键和超时属于后续日常设置。
+
+语音联调还需要 `VOLCENGINE_API_KEY` 和 `ARK_API_KEY`，分别用于火山识别/合成与 System One。缺少语音配置时开发入口显示原因，文字对话继续使用自身配置。
 
 ## 3 加载前端构建产物
 
@@ -84,6 +88,10 @@ uv run --locked voice-super-agent --desktop-check
 - “开始后台活动”启动真实 asyncio 任务，每秒产生约 20 次计数状态；停止后保留当前计数。
 - “预览悬浮宿主”隐藏主窗口，在工作区右下角显示圆角卡片和圆球。卡片支持内部滚动，圆球切换卡片展开与收起。
 - 卡片的“×”只隐藏悬浮组件；托盘中的“显示收音窗”可找回已预览过的宿主。“打开主窗口”会收起悬浮组件并显示主窗口。
+- “开始语音联调”使用默认输入和输出设备启动连续语音。请佩戴耳机，等待“语音：已启动”后直接说话；识别、判意、思考和播报状态会同步显示。
+- “停止语音联调”关闭当前语音执行对象并保存实际上下文，随后可以继续文字追问。本轮语音联调期间文字输入暂停，跨入口交错接管在后续接入。
+
+语音按 16 kHz 单声道采集，火山 TTS 与播放按 24 kHz 单声道衔接。正式唤醒、空闲超时和默认设备变化恢复仍按后续计划接入。ASR 分句定稿由原生用户轮次继续聚合；播报期间的附和记录在展示历史中，接管则保留旧回复片段并发起新轮次。
 
 联调区域用于验证窗口、线程和推送。语音驱动的自动显示、收音音量环和单轮问答在对应阶段接入。普通启动时托盘的“显示收音窗”先保持不可用。
 
@@ -111,7 +119,7 @@ uv run --locked voice-super-agent --desktop-check
 
 ```powershell
 npm --prefix frontend run typecheck
-uv run --locked python -m unittest discover -s tests -v
+uv run --locked pytest -q
 uv run --locked voice-super-agent --help
 uv run --locked python -c "import sys; import voice_super_agent; print(sys.executable); print(voice_super_agent.__file__)"
 ```

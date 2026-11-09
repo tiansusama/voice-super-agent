@@ -11,7 +11,7 @@ from typing import Any
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from voice_super_agent.conversation import TextConversation
+from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
 
 
@@ -29,7 +29,9 @@ class Runtime:
         self._views: set[str] = set()
         self._sequence = 0
         self._activity: asyncio.Task | None = None
-        self._conversation: TextConversation | None = None
+        self._conversation: Conversation | None = None
+        self._voice_task: asyncio.Task | None = None
+        self._execution_lock = asyncio.Lock()
         self._inputs: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._input_task: asyncio.Task | None = None
         self._api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -60,6 +62,9 @@ class Runtime:
             "storage_status": "saved",
             "storage_error": "",
             "exiting": False,
+            "voice_status": "off",
+            "voice_activity": "listening",
+            "voice_error": "",
         }
 
     def start(self) -> None:
@@ -76,7 +81,8 @@ class Runtime:
             return
         self._storage_ready = True
         self._messages = {message["id"]: message for message in saved["messages"]}
-        self._user_ids = {message["reply_id"]: message["id"] for message in saved["messages"] if message["role"] == "user"}
+        self._user_ids = {message["reply_id"]: message["id"] for message in saved["messages"]
+                          if message["role"] == "user" and message["status"] != "backchannel"}
         self._model_records = saved["model_records"]
         self._window = saved["window"]
         unfinished = [message for message in self._messages.values() if message["status"] in {"queued", "thinking", "streaming"}]
@@ -123,6 +129,8 @@ class Runtime:
             raise ValueError("正在保存并退出，请等待。")
         if not self._state["model_available"]:
             raise ValueError(self._state["model_error"])
+        if self._state["voice_status"] in {"starting", "active", "stopping"}:
+            raise ValueError("语音联调期间请先停止语音，再发送文字。")
         user_id, reply_id = uuid4().hex, uuid4().hex
         timestamp = datetime.now(timezone.utc).isoformat()
         self._messages[user_id] = {
@@ -144,29 +152,107 @@ class Runtime:
     async def _run_inputs(self) -> None:
         """串行提交输入，模型生成继续由原生流水线异步执行。"""
         try:
-            self._conversation = TextConversation(
-                self._api_key, self._state["model"],
-                self._base_url,
-                self._conversation_event,
-                messages=deepcopy([record["message"] for record in self._model_records[self._window["model_start_position"]:]]),
-            )
-            await self._conversation.start()
             while True:
                 reply_id, text = await self._inputs.get()
-                await self._conversation.send(reply_id, text)
+                async with self._execution_lock:
+                    if self._conversation is not None and self._conversation.voice_enabled:
+                        await self._conversation.close()
+                        self._conversation = None
+                    if self._conversation is None:
+                        self._conversation = self._create_conversation(voice=False)
+                        await self._conversation.start()
+                    await self._conversation.send(reply_id, text)
         except (RuntimeError, TimeoutError, ValueError) as exc:
             logger.exception("文字输入处理失败")
             self._conversation_event({"type": "unavailable", "error": str(exc)})
             if self._conversation is not None:
                 await self._conversation.close()
 
+    def _create_conversation(self, voice: bool) -> Conversation:
+        return Conversation(
+            self._api_key, self._state["model"], self._base_url, self._conversation_event,
+            messages=deepcopy([record["message"] for record in self._model_records[self._window["model_start_position"]:]]),
+            voice=voice,
+        )
+
+    async def _close_conversation(self) -> None:
+        if self._input_task is not None:
+            self._input_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._input_task
+            self._input_task = None
+        if self._conversation is not None:
+            await self._conversation.close()
+            self._conversation = None
+        while not self._inputs.empty():
+            self._inputs.get_nowait()
+        for message in self._messages.values():
+            if message["status"] in {"queued", "thinking", "streaming"}:
+                message["status"] = "unfinished"
+        self._update({"active_reply_id": None})
+        self._request_save(immediate=True)
+
+    async def _set_voice(self, enabled: bool) -> None:
+        async with self._execution_lock:
+            try:
+                await self._close_conversation()
+                if enabled:
+                    # 切换执行对象前完成已有提交的事务，保存失败时保留文字与窗口。
+                    if not await self._flush():
+                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"]})
+                        return
+                    self._conversation = self._create_conversation(voice=True)
+                    await self._conversation.start()
+                    if self._state["storage_error"]:
+                        await self._close_conversation()
+                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"]})
+                        return
+                self._update({"voice_status": "active" if enabled else "off", "voice_activity": "listening"})
+            except (RuntimeError, TimeoutError, ValueError, OSError) as exc:
+                logger.exception("切换语音失败")
+                if self._conversation is not None:
+                    await self._conversation.close()
+                    self._conversation = None
+                self._update({"voice_status": "error", "voice_error": f"语音启动失败：{exc}"})
+
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "voice_activity":
+            self._update({"voice_activity": event["activity"]})
+            return
+        if event["type"] == "voice_error":
+            self._update({"voice_error": event["error"]})
+            return
+        if event["type"] in {"voice_input", "voice_committed", "voice_unfinished", "backchannel"}:
+            reply_id = event["reply_id"]
+            backchannel = event["type"] == "backchannel"
+            status = {"voice_input": "streaming", "voice_committed": "completed",
+                      "voice_unfinished": "unfinished", "backchannel": "backchannel"}[event["type"]]
+            self._messages[event["user_id"]] = {
+                "id": event["user_id"], "role": "user", "source": "voice", "reply_id": reply_id,
+                "text": event["text"], "status": status,
+                "created_at": event["created_at"], "error": "",
+            }
+            if not backchannel:
+                self._user_ids[reply_id] = event["user_id"]
+                if reply_id not in self._messages:
+                    self._messages[reply_id] = {"id": reply_id, "role": "assistant", "source": "voice", "reply_id": reply_id,
+                                                "text": "", "status": "queued", "created_at": event["created_at"], "error": ""}
+                if event["type"] in {"voice_committed", "voice_unfinished"}:
+                    self._messages[reply_id]["status"] = "thinking"
+                    self._capture_context(event["messages"], reply_id)
+                    self._update({"active_reply_id": reply_id, "voice_activity": "thinking"})
+            self._request_save(immediate=event["type"] != "voice_input")
+            self._update({})
+            return
         if event["type"] == "unavailable":
             for message in self._messages.values():
                 if message["status"] in {"queued", "thinking", "streaming"}:
                     message.update(status="failed", error=event["error"])
             self._request_save(immediate=True)
-            self._update({"model_available": False, "model_error": event["error"], "active_reply_id": None})
+            if event.get("voice", False):
+                self._update({"voice_status": "error", "voice_error": self._state["voice_error"] or event["error"], "active_reply_id": None})
+            else:
+                self._update({"model_available": False, "model_error": event["error"], "active_reply_id": None})
             return
         if event["type"] == "context":
             self._capture_context(event["messages"], event["reply_id"])
@@ -230,6 +316,10 @@ class Runtime:
             except (sqlite3.Error, OSError) as exc:
                 logger.exception("保存对话失败")
                 self._update({"storage_status": "error", "storage_error": f"保存对话失败：{exc}。已暂停新消息；请处理原因后再次点击退出应用以保存。"})
+                if self._state["voice_status"] == "active":
+                    # 保存失败后停止语音输入，保留内存中的原生提交供退出时重试。
+                    self._update({"voice_status": "stopping"})
+                    self._voice_task = asyncio.create_task(self._set_voice(False), name="stop-voice-on-storage-error")
                 return False
             self._saved_revision = revision
             self._update({"storage_status": "saved" if revision == self._revision else "saving", "storage_error": ""})
@@ -253,17 +343,11 @@ class Runtime:
             return True
         self._update({"exiting": True})
         await self._stop_activity()
-        if self._input_task is not None:
-            self._input_task.cancel()
+        if self._voice_task is not None:
+            self._voice_task.cancel()
             with suppress(asyncio.CancelledError):
-                await self._input_task
-            self._input_task = None
-        if self._conversation is not None:
-            await self._conversation.close()
-            self._conversation = None
-        for message in self._messages.values():
-            if message["status"] in {"queued", "thinking", "streaming"}:
-                message["status"] = "unfinished"
+                await self._voice_task
+        await self._close_conversation()
         self._update({"active_reply_id": None})
         if self._storage_ready:
             self._request_save(immediate=True)
@@ -285,6 +369,20 @@ class Runtime:
                 self._activity = asyncio.create_task(self._run_activity())
         elif command == "stop_activity":
             await self._stop_activity()
+        elif command in {"start_voice", "stop_voice"}:
+            if self._state["storage_error"] or self._state["exiting"]:
+                raise ValueError(self._state["storage_error"] or "正在保存并退出，请等待。")
+            if self._voice_task is not None and not self._voice_task.done():
+                raise ValueError("语音正在切换，请等待。")
+            enabled = command == "start_voice"
+            if enabled:
+                missing = [name for name in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY")
+                           if not os.getenv(name, "").strip()]
+                if missing:
+                    self._update({"voice_status": "error", "voice_error": "缺少语音配置：" + "、".join(missing)})
+                    return
+            self._update({"voice_status": "starting" if enabled else "stopping", "voice_error": ""})
+            self._voice_task = asyncio.create_task(self._set_voice(enabled), name="switch-voice")
         else:
             raise ValueError(f"未知桌面命令：{command}")
 
