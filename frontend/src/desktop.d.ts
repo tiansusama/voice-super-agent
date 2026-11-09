@@ -22,6 +22,12 @@ interface DesktopSnapshot {
     wake_word: string;
     wake_hotkey: string;
     voice_idle_seconds: number;
+    microphone_level: number;
+    playback_level: number;
+    microphone_device: string;
+    playback_device: string;
+    audio_device_pending: boolean;
+    playback_stop_ms: number;
   };
 }
 

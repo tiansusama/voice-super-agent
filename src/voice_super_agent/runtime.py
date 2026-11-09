@@ -17,6 +17,7 @@ from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.wake import KeywordDetector
+from voice_super_agent.audio.devices import read_devices
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class Runtime:
         self._detector: KeywordDetector | None = None
         self._hotkey_task: asyncio.Task | None = None
         self._idle_task: asyncio.Task | None = None
+        self._device_task: asyncio.Task | None = None
         self._execution_lock = asyncio.Lock()
         self._inputs: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._input_task: asyncio.Task | None = None
@@ -79,6 +81,12 @@ class Runtime:
             "wake_word": "你好小博",
             "wake_hotkey": "Ctrl+\\",
             "voice_idle_seconds": 60,
+            "microphone_level": 0.0,
+            "playback_level": 0.0,
+            "microphone_device": "",
+            "playback_device": "",
+            "audio_device_pending": False,
+            "playback_stop_ms": 0.0,
         }
 
     def start(self) -> None:
@@ -109,6 +117,7 @@ class Runtime:
         if self._wake_model_dir is not None:
             self._update({"voice_status": "starting"})
             self._voice_task = asyncio.create_task(self._set_voice(False), name="prepare-wake-host")
+            self._device_task = asyncio.create_task(self._watch_audio_devices(), name="audio-devices")
 
     def connect(self, view: str) -> dict[str, Any]:
         return asyncio.run_coroutine_threadsafe(self._connect(view), self._loop).result()
@@ -173,6 +182,9 @@ class Runtime:
             while True:
                 reply_id, text = await self._inputs.get()
                 async with self._execution_lock:
+                    if self._conversation is not None and self._conversation._runner_task.done():
+                        await self._conversation.close()
+                        self._conversation = None
                     if self._conversation is None:
                         self._conversation = self._create_conversation(voice=False)
                         await self._conversation.start()
@@ -225,6 +237,7 @@ class Runtime:
                         self._update({"wake_word": self._wake_settings.word, "wake_hotkey": self._wake_settings.hotkey,
                                       "voice_idle_seconds": self._wake_settings.idle_seconds})
                     if enabled:
+                        await self._use_default_audio()
                         await self._conversation.activate_voice()
                         if self._state["storage_error"]:
                             raise RuntimeError(self._state["storage_error"])
@@ -235,6 +248,8 @@ class Runtime:
                             await self._close_conversation()
                         elif self._conversation._voice.gate.mode != "standby":
                             await self._conversation.standby_voice()
+                        if not self._state["storage_error"]:
+                            await self._use_default_audio()
                         self._lifecycle.deactivate()
                         for message in self._messages.values():
                             if message["status"] in {"queued", "thinking", "streaming"}:
@@ -293,7 +308,7 @@ class Runtime:
 
     async def _watch_hotkey(self, hotkey):
         while True:
-            if hotkey.sample(hotkey.pressed(), self._loop.time()):
+            if hotkey.sample(hotkey.pressed(), self._loop.time()) and self._state["voice_status"] == "standby":
                 await self._command("wake_voice")
             await asyncio.sleep(0.02)
 
@@ -303,7 +318,55 @@ class Runtime:
                 await self._command("end_voice")
             await asyncio.sleep(0.05)
 
+    async def _use_default_audio(self):
+        transport = self._conversation._voice.transport
+        devices = await asyncio.to_thread(read_devices)
+        if not devices.contains(transport.devices):
+            raise OSError("当前录音或播放设备已失效，请恢复语音以打开 Windows 当前默认设备。")
+        if devices.defaults != transport.devices.defaults:
+            await self._conversation.reopen_audio()
+        self._update({"audio_device_pending": False})
+
+    async def _watch_audio_devices(self):
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                async with self._execution_lock:
+                    if self._state["voice_status"] not in {"standby", "active"}:
+                        continue
+                    transport = self._conversation._voice.transport
+                    devices = await asyncio.to_thread(read_devices)
+                    active = await asyncio.to_thread(transport.is_active)
+                    if not devices.contains(transport.devices) or not active:
+                        raise OSError("当前录音或播放设备已失效，请恢复语音以打开 Windows 当前默认设备。")
+                    changed = devices.defaults != transport.devices.defaults
+                    if self._state["voice_status"] == "standby" and changed:
+                        await self._conversation.reopen_audio()
+                        self._update({"audio_device_pending": False})
+                    elif changed != self._state["audio_device_pending"]:
+                        self._update({"audio_device_pending": changed})
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.exception("音频设备不可用")
+                if self._voice_task is not None and not self._voice_task.done():
+                    self._voice_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._voice_task
+                async with self._execution_lock:
+                    await self._close_conversation()
+                    self._lifecycle.deactivate()
+                    self._update({"voice_status": "error", "voice_error": str(exc), "active_reply_id": None,
+                                  "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
+
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "audio_levels":
+            self._update({"microphone_level": event["microphone"], "playback_level": event["playback"]})
+            return
+        if event["type"] == "audio_devices":
+            self._update({"microphone_device": event["microphone"], "playback_device": event["speaker"]})
+            return
+        if event["type"] == "audio_stop":
+            self._update({"playback_stop_ms": event["elapsed_ms"]})
+            return
         if event["type"] == "wake":
             asyncio.create_task(self._command("wake_voice"), name="keyword-wake")
             return
@@ -450,7 +513,7 @@ class Runtime:
             return True
         self._update({"exiting": True})
         self._lifecycle.deactivate()
-        for task in (self._hotkey_task, self._idle_task):
+        for task in (self._hotkey_task, self._idle_task, self._device_task):
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -482,23 +545,26 @@ class Runtime:
                 self._activity = asyncio.create_task(self._run_activity())
         elif command == "stop_activity":
             await self._stop_activity()
-        elif command in {"start_voice", "stop_voice", "wake_voice", "end_voice"}:
+        elif command in {"start_voice", "stop_voice", "wake_voice", "end_voice", "recover_voice"}:
             enabled = command in {"start_voice", "wake_voice"}
-            if (enabled and self._state["storage_error"]) or self._state["exiting"]:
+            recovering = command == "recover_voice"
+            if ((enabled or recovering) and self._state["storage_error"]) or self._state["exiting"]:
                 raise ValueError(self._state["storage_error"] or "正在保存并退出，请等待。")
-            if enabled and self._state["voice_status"] in {"starting", "active", "stopping"}:
+            if (enabled or recovering) and self._state["voice_status"] in {"starting", "active", "stopping"}:
+                return
+            if enabled and self._state["voice_status"] == "error":
                 return
             if not enabled and self._voice_task is not None and not self._voice_task.done():
                 self._voice_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._voice_task
-            if enabled:
+            if enabled or recovering:
                 try:
                     self._require_voice_configuration()
                 except ValueError as exc:
                     self._update({"voice_status": "error", "voice_error": str(exc)})
                     return
-            self._update({"voice_status": "starting" if enabled else "stopping", "voice_error": ""})
+            self._update({"voice_status": "starting" if enabled or recovering else "stopping", "voice_error": ""})
             self._voice_task = asyncio.create_task(self._set_voice(enabled), name="switch-voice")
         else:
             raise ValueError(f"未知桌面命令：{command}")

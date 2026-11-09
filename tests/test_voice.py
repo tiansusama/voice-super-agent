@@ -12,7 +12,7 @@ from aiohttp import web
 from loguru import logger
 import pytest
 import pytest_asyncio
-from pipecat.frames.frames import StartFrame, InputAudioRawFrame, VADUserStartedSpeakingFrame
+from pipecat.frames.frames import StartFrame, InputAudioRawFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
@@ -21,6 +21,7 @@ from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from voice_super_agent.runtime import Runtime
 from voice_super_agent import runtime as runtime_module
 from voice_super_agent.desktop.hotkey import HoldHotkey
+from voice_super_agent.audio.devices import AudioDevices, Endpoint
 from voice_super_agent.voice import pipeline as voice_pipeline
 from voice_super_agent.voice import volcengine
 
@@ -63,6 +64,10 @@ class VoiceHarness:
         self.closed_audio = False
         self.classifications = []
         self.release_model = asyncio.Event()
+        self.devices = AudioDevices(Endpoint("mic-1", "测试麦克风"), Endpoint("speaker-1", "测试播放"),
+                                    frozenset({"mic-1", "speaker-1"}))
+        self.audio_reopens = 0
+        self.audio_active = True
         self.asr_connections = 0
         self.asr_ready = asyncio.Event()
         self.asr_ready.set()
@@ -172,13 +177,21 @@ async def voice(tmp_path, monkeypatch, request):
             url + ("/systemone" if endpoint.endswith("systemone") else "/tts"), **options)
         return client
 
-    def audio(params):
+    def audio(params, emit):
         harness.input = MemoryInput(params)
         harness.output = MemoryOutput(params)
-        return SimpleNamespace(input=lambda: harness.input, output=lambda: harness.output,
-                               _pyaudio=SimpleNamespace(terminate=lambda: setattr(harness, "closed_audio", True)))
+        async def close():
+            harness.closed_audio = True
+        async def reopen():
+            harness.audio_reopens += 1
+            transport.devices = harness.devices
+        transport = SimpleNamespace(input=lambda: harness.input, output=lambda: harness.output,
+                                    close=close, reopen=reopen, devices=harness.devices,
+                                    is_active=lambda: harness.audio_active)
+        return transport
 
-    monkeypatch.setattr(voice_pipeline, "LocalAudioTransport", audio)
+    monkeypatch.setattr(voice_pipeline, "DesktopAudioTransport", audio)
+    monkeypatch.setattr(runtime_module, "read_devices", lambda: harness.devices)
     monkeypatch.setattr(voice_pipeline.aiohttp, "ClientSession", session)
     monkeypatch.setattr(volcengine, "connect", lambda endpoint, **kwargs: original_connect(
         url.replace("http://", "ws://") + "/asr", **kwargs))
@@ -289,8 +302,11 @@ async def test_unfinished_voice_and_backchannel_survive_restart(voice):
 
 @pytest.mark.asyncio
 async def test_multiple_final_asr_segments_form_one_native_user_turn(voice):
+    await voice.backend(voice.runtime._conversation._user.queue_frame(VADUserStartedSpeakingFrame()))
     await voice.transcript("先说第一句。")
     await voice.transcript("再补第二句。")
+    await voice.wait(lambda s: any("第二句" in m["text"] for m in s["messages"] if m["role"] == "user"))
+    await voice.backend(voice.runtime._conversation._user.queue_frame(VADUserStoppedSpeakingFrame()))
     voice.release_audio()
     await voice.wait(lambda s: bool(s["messages"]) and s["messages"][-1]["status"] == "completed")
     assert len(voice.requests) == 1
@@ -554,3 +570,75 @@ async def test_asr_handshake_failure_is_reported_and_text_remains_available(voic
     assert voice.closed_audio
     voice.runtime.send_text("继续文字交流。")
     await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_standby_default_change_reopens_audio_without_interrupting_text_or_context(voice):
+    conversation = voice.runtime._conversation
+    voice.runtime.send_text("等待模型。")
+    await voice.wait(lambda s: bool(voice.requests))
+    voice.devices = AudioDevices(Endpoint("mic-2", "新麦克风"), Endpoint("speaker-2", "新播放"),
+                                frozenset({"mic-1", "speaker-1", "mic-2", "speaker-2"}))
+    await voice.wait(lambda s: voice.audio_reopens == 1)
+    assert voice.runtime._conversation is conversation
+    assert voice.asr_connections == 0
+    assert voice.runtime.connect("test")["messages"][-1]["status"] == "thinking"
+    voice.release_model.set()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_active_default_change_is_deferred_until_standby(voice):
+    await voice.wake()
+    conversation = voice.runtime._conversation
+    voice.devices = AudioDevices(Endpoint("mic-2", "新麦克风"), Endpoint("speaker-2", "新播放"),
+                                frozenset({"mic-1", "speaker-1", "mic-2", "speaker-2"}))
+    await voice.wait(lambda s: s["state"]["audio_device_pending"])
+    assert voice.audio_reopens == 0
+    assert voice.runtime._conversation._voice.stt._socket is not None
+    voice.runtime.command("end_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert voice.audio_reopens == 1
+    assert voice.runtime._conversation is conversation
+    assert not voice.runtime.connect("test")["state"]["audio_device_pending"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+@pytest.mark.parametrize("standby", [False, True])
+async def test_device_loss_releases_audio_and_manual_recovery_returns_to_standby(voice, standby):
+    if not standby:
+        await voice.wake()
+        await voice.transcript("记住我的问题。")
+        voice.release_audio()
+        await voice.wait(lambda s: bool(s["messages"]) and s["messages"][-1]["status"] == "completed")
+    connections = voice.asr_connections
+    voice.devices = AudioDevices(Endpoint("mic-2", "新麦克风"), Endpoint("speaker-2", "新播放"),
+                                frozenset({"mic-2", "speaker-2"}))
+    snapshot = await voice.wait(lambda s: s["state"]["voice_status"] == "error")
+    assert "失效" in snapshot["state"]["voice_error"]
+    assert voice.closed_audio
+    assert voice.runtime._conversation is None
+    assert snapshot["state"]["microphone_level"] == snapshot["state"]["playback_level"] == 0
+    voice.runtime.command("wake_voice")
+    assert voice.asr_connections == connections
+    voice.runtime.send_text("现在继续文字。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    voice.runtime.command("recover_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert voice.asr_connections == connections
+    assert voice.runtime._conversation._voice.stt._socket is None
+    if not standby:
+        users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
+        assert users == ["记住我的问题。", "现在继续文字。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_audio_stream_failure_reports_unavailability_even_if_endpoint_is_still_present(voice):
+    voice.audio_active = False
+    await voice.wait(lambda s: s["state"]["voice_status"] == "error")
+    assert voice.closed_audio
+    assert voice.runtime._conversation is None

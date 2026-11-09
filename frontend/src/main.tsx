@@ -143,8 +143,9 @@ function App() {
           </div>
           {state.voice_status === 'starting' || state.voice_status === 'active' ?
             <button onClick={() => void command('end_voice')} disabled={state.exiting}>结束语音</button> :
-            <button onClick={() => void command('wake_voice')}
-              disabled={voiceBusy || !!state.storage_error || state.exiting || !state.model_available}>唤醒语音</button>}
+            <button onClick={() => void command(state.voice_status === 'error' ? 'recover_voice' : 'wake_voice')}
+              disabled={voiceBusy || !!state.storage_error || state.exiting || !state.model_available}>
+              {state.voice_status === 'error' ? '恢复语音' : '唤醒语音'}</button>}
         </div>
         {state.voice_error && <p role="alert" className="model-error">{state.voice_error}</p>}
         {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}

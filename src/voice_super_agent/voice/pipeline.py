@@ -6,13 +6,14 @@ import numpy as np
 import aiohttp
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
-from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.transports.local.audio import LocalAudioTransportParams
 from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from voice_super_agent.voice.interruption import SystemOneInterruptionProcessor
 from voice_super_agent.voice.volcengine import VolcengineSTTService, VolcengineTTSService
 from voice_super_agent.voice.wake import WakeAudioGate, RecognitionGate
+from voice_super_agent.audio.transport import DesktopAudioTransport
 from pipecat.frames.frames import TTSStartedFrame, TTSStoppedFrame, TTSAudioRawFrame
 
 
@@ -27,11 +28,11 @@ class VoicePipeline:
             vad_analyzer=SileroVADAnalyzer(),
             user_turn_strategies=UserTurnStrategies(start=[TranscriptionUserTurnStartStrategy()]),
         )
-        self.transport = LocalAudioTransport(LocalAudioTransportParams(
+        self.transport = DesktopAudioTransport(LocalAudioTransportParams(
             audio_in_enabled=True, audio_out_enabled=True,
-            audio_in_sample_rate=16000, audio_out_sample_rate=24000,
+            audio_in_sample_rate=16000, audio_out_sample_rate=16000,
             audio_in_channels=1, audio_out_channels=1,
-        ))
+        ), emit)
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         self.stt = VolcengineSTTService(api_key=os.environ["VOLCENGINE_API_KEY"], defer_connection=True)
         self.interruption = SystemOneInterruptionProcessor(
@@ -64,5 +65,4 @@ class VoicePipeline:
 
     async def close(self):
         await self._session.close()
-        # worker 已释放输入与输出流，最后结束 PortAudio 的设备资源。
-        self.transport._pyaudio.terminate()
+        await self.transport.close()

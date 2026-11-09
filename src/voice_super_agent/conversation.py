@@ -331,6 +331,12 @@ class Conversation:
         await self._voice.gate.reset_detector()
         self._voice.gate.mode = "standby"
 
+    async def reopen_audio(self):
+        self._voice.gate.mode = "paused"
+        await self._voice.transport.reopen()
+        await self._voice.gate.reset_detector()
+        self._voice.gate.mode = "standby"
+
     async def _run(self) -> None:
         try:
             await self._runner.run()
