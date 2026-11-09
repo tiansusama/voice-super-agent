@@ -16,9 +16,12 @@ interface DesktopSnapshot {
     storage_status: 'saving' | 'saved' | 'error';
     storage_error: string;
     exiting: boolean;
-    voice_status: 'off' | 'starting' | 'active' | 'stopping' | 'error';
+    voice_status: 'off' | 'standby' | 'starting' | 'active' | 'stopping' | 'error';
     voice_activity: 'listening' | 'recognizing' | 'classifying' | 'thinking' | 'speaking';
     voice_error: string;
+    wake_word: string;
+    wake_hotkey: string;
+    voice_idle_seconds: number;
   };
 }
 

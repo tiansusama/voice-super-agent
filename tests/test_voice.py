@@ -5,19 +5,22 @@ import json
 import sqlite3
 import struct
 from types import SimpleNamespace
+from websockets.exceptions import InvalidHandshake
 
 import aiohttp
 from aiohttp import web
 from loguru import logger
 import pytest
 import pytest_asyncio
-from pipecat.frames.frames import StartFrame
+from pipecat.frames.frames import StartFrame, InputAudioRawFrame, VADUserStartedSpeakingFrame
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from voice_super_agent.runtime import Runtime
+from voice_super_agent import runtime as runtime_module
+from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice import pipeline as voice_pipeline
 from voice_super_agent.voice import volcengine
 
@@ -32,6 +35,7 @@ class MemoryOutput(BaseOutputTransport):
     def __init__(self, params):
         super().__init__(params)
         self.release = asyncio.Event()
+        self.release.set()
         self.audio = bytearray()
 
     async def start(self, frame: StartFrame):
@@ -40,7 +44,11 @@ class MemoryOutput(BaseOutputTransport):
 
     async def write_audio_frame(self, frame):
         self.audio.extend(frame.audio)
-        await self.release.wait()
+        # 模拟有界设备写入，打断后正在写的一个音频块仍会返回。
+        try:
+            await asyncio.wait_for(self.release.wait(), timeout=0.25)
+        except TimeoutError:
+            pass
         await asyncio.sleep(len(frame.audio) / (2 * self.sample_rate))
         return True
 
@@ -55,10 +63,19 @@ class VoiceHarness:
         self.closed_audio = False
         self.classifications = []
         self.release_model = asyncio.Event()
+        self.asr_connections = 0
+        self.asr_ready = asyncio.Event()
+        self.asr_ready.set()
+        self.ending = False
+        self.silent_ending = False
 
     async def recognize(self, request):
         self.asr = web.WebSocketResponse()
         await self.asr.prepare(request)
+        self.asr_connections += 1
+        await self.asr_ready.wait()
+        payload = gzip.compress(json.dumps({"code": 0}).encode())
+        await self.asr.send_bytes(b"\x11\x90\x11\x00" + struct.pack(">I", len(payload)) + payload)
         async for message in self.asr:
             self.stt_packets.append(message.data)
         return self.asr
@@ -83,12 +100,21 @@ class VoiceHarness:
     async def complete(self, request):
         payload = await request.json()
         self.requests.append(payload)
+        self.ending = payload["messages"][-1]["role"] == "tool"
         if payload["messages"][-1]["content"] == "等待模型。":
             await self.release_model.wait()
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         try:
             await response.prepare(request)
-            for text in ("测试", "回复。"):
+            if payload["messages"][-1]["content"] == "结束语音。":
+                chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
+                         "model": "test-model", "choices": [{"index": 0, "delta": {"tool_calls": [
+                             {"index": 0, "id": "end-test", "type": "function",
+                              "function": {"name": "end_voice", "arguments": "{}"}},
+                         ]}, "finish_reason": "tool_calls"}]}
+                await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            for text in (() if payload["messages"][-1]["content"] == "结束语音。" or (self.ending and self.silent_ending)
+                         else ("测试", "回复。")):
                 chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
                          "model": "test-model", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                 await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
@@ -98,19 +124,32 @@ class VoiceHarness:
         return response
 
     async def wait(self, predicate):
-        async with asyncio.timeout(8):
-            while True:
-                snapshot = self.runtime.connect("test")
-                if predicate(snapshot):
-                    return snapshot
-                await asyncio.sleep(0.01)
+        try:
+            async with asyncio.timeout(8):
+                while True:
+                    snapshot = self.runtime.connect("test")
+                    if predicate(snapshot):
+                        return snapshot
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            raise AssertionError(self.runtime.connect("test")) from None
 
     def release_audio(self):
         self.runtime._loop.call_soon_threadsafe(self.output.release.set)
 
+    async def backend(self, coroutine):
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coroutine, self.runtime._loop))
+
+    async def wake(self):
+        self.release_audio()
+        self.runtime.command("wake_voice")
+        await self.wait(lambda s: s["state"]["voice_status"] == "active")
+        self.output.audio.clear()
+        self.runtime._loop.call_soon_threadsafe(self.output.release.clear)
+
 
 @pytest_asyncio.fixture
-async def voice(tmp_path, monkeypatch):
+async def voice(tmp_path, monkeypatch, request):
     logger.disable("pipecat")
     harness = VoiceHarness()
     app = web.Application()
@@ -149,15 +188,26 @@ async def voice(tmp_path, monkeypatch):
     for key in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY"):
         monkeypatch.setenv(key, "test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", url)
-    harness.runtime = Runtime(desktop_check=True, database_path=tmp_path / "voice.sqlite3")
+    standby = getattr(request, "param", False)
+    harness.detector = SimpleNamespace(reset=lambda: None, feed=lambda audio, rate: False)
+    monkeypatch.setattr(runtime_module, "KeywordDetector", lambda directory, word: harness.detector)
+    monkeypatch.setattr(HoldHotkey, "pressed", lambda self: False)
+    harness.runtime = Runtime(desktop_check=True, database_path=tmp_path / "voice.sqlite3",
+                              wake_model_dir=tmp_path if standby else None)
     harness.runtime.start()
-    harness.runtime.command("start_voice")
+    if not standby:
+        harness.runtime.command("start_voice")
     try:
-        await harness.wait(lambda s: s["state"]["voice_status"] in {"active", "error"})
-        assert harness.runtime.connect("test")["state"]["voice_status"] == "active"
+        expected = "standby" if standby else "active"
+        await harness.wait(lambda s: s["state"]["voice_status"] in {expected, "error"})
+        assert harness.runtime.connect("test")["state"]["voice_status"] == expected
+        if not standby:
+            harness.output.audio.clear()
+            harness.runtime._loop.call_soon_threadsafe(harness.output.release.clear)
         yield harness
     finally:
         harness.release_model.set()
+        harness.asr_ready.set()
         await asyncio.to_thread(harness.runtime.stop)
         await server.cleanup()
         logger.enable("pipecat")
@@ -242,7 +292,7 @@ async def test_multiple_final_asr_segments_form_one_native_user_turn(voice):
     await voice.transcript("先说第一句。")
     await voice.transcript("再补第二句。")
     voice.release_audio()
-    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    await voice.wait(lambda s: bool(s["messages"]) and s["messages"][-1]["status"] == "completed")
     assert len(voice.requests) == 1
     user = [m for m in voice.requests[0]["messages"] if m["role"] == "user"]
     assert len(user) == 1
@@ -333,3 +383,174 @@ async def test_starting_voice_requires_previous_conversation_save_to_succeed(voi
         assert voice.runtime._conversation is None
     finally:
         voice.runtime._store.save = original_save
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_local_wake_waits_for_cloud_ready_and_ding_then_releases_input(voice):
+    assert voice.asr_connections == 0
+    assert not voice.output.audio
+    assert voice.runtime._conversation._voice.stt._socket is None
+    voice.asr_ready.clear()
+    voice.detector.feed = lambda audio, rate: True
+    await voice.backend(voice.input.push_audio_frame(InputAudioRawFrame(b"\x01\x00" * 320, 16000, 1)))
+    await voice.wait(lambda s: voice.asr_connections == 1)
+    assert voice.runtime.connect("test")["state"]["voice_status"] == "starting"
+    assert not voice.output.audio
+    voice.asr_ready.set()
+    await voice.wait(lambda s: s["state"]["voice_status"] == "active")
+    assert voice.output.audio
+    assert not voice.runtime.connect("test")["messages"]
+    voice.runtime.command("wake_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "active")
+    assert voice.asr_connections == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_end_during_preparation_returns_to_working_local_standby(voice):
+    voice.asr_ready.clear()
+    voice.runtime.command("wake_voice")
+    await voice.wait(lambda s: voice.asr_connections == 1)
+    voice.runtime.command("end_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert voice.runtime._conversation._voice.gate.mode == "standby"
+    assert voice.runtime._conversation._voice.stt._socket is None
+    voice.asr_ready.set()
+    await voice.wake()
+    assert voice.asr_connections == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_button_end_cancels_playback_and_rewake_keeps_context_and_worker(voice):
+    await voice.wake()
+    conversation = voice.runtime._conversation
+    await voice.transcript("请记住语音问题。")
+    await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking")
+    voice.runtime.command("end_voice")
+    snapshot = await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert snapshot["messages"][1]["text"] == "测试回复。"
+    assert voice.runtime._conversation is conversation
+    assert not voice.closed_audio
+    assert conversation._voice.stt._socket is None
+    await voice.wake()
+    await voice.transcript("继续追问。")
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"] == ["请记住语音问题。", "继续追问。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+@pytest.mark.parametrize("silent", [False, True])
+async def test_agent_end_waits_for_final_reply_and_real_playback(voice, silent):
+    await voice.wake()
+    voice.silent_ending = silent
+    await voice.transcript("结束语音。")
+    if not silent:
+        await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking" and voice.ending)
+        assert voice.runtime.connect("test")["state"]["voice_status"] == "active"
+        voice.release_audio()
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert voice.asr_connections == 1
+    assert voice.runtime._conversation._voice.stt._socket is None
+    assert any(m["role"] == "tool" for m in voice.requests[-1]["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_new_takeover_cancels_pending_agent_end(voice):
+    await voice.wake()
+    await voice.transcript("结束语音。")
+    await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking" and voice.ending)
+    voice.decision = "interrupt"
+    await voice.transcript("等一下，继续聊。")
+    await voice.wait(lambda s: len(s["messages"]) >= 4)
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert voice.runtime._lifecycle.ending_reply is None
+    assert voice.runtime.connect("test")["state"]["voice_status"] == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_standby_text_stays_text_and_next_voice_reply_still_plays(voice):
+    voice.runtime.send_text("先用文字交流。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert not voice.output.audio
+    assert voice.asr_connections == 0
+    assert "tools" not in voice.requests[-1] or not voice.requests[-1]["tools"]
+    await voice.wake()
+    await voice.transcript("换成语音继续。")
+    await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking")
+    assert voice.output.audio
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"] == ["先用文字交流。", "换成语音继续。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_runtime_idle_timeout_closes_asr_without_closing_the_local_worker(voice):
+    await voice.wake()
+    async def expire_wait():
+        voice.runtime._lifecycle.deadline = voice.runtime._loop.time() - 1
+    await voice.backend(expire_wait())
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert not voice.closed_audio
+    assert voice.runtime._conversation._voice.stt._socket is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_end_during_unfinished_speech_resets_native_turn_without_recovery_reply(voice):
+    await voice.wake()
+    conversation = voice.runtime._conversation
+    await voice.backend(conversation._user.queue_frame(VADUserStartedSpeakingFrame()))
+    await voice.transcript("还没说完", final=False)
+    await voice.wait(lambda s: bool(s["messages"]))
+    voice.runtime.command("end_voice")
+    snapshot = await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert voice.requests == []
+    assert snapshot["messages"][0]["text"] == "还没说完"
+    assert snapshot["messages"][0]["status"] == "unfinished"
+    assert not conversation._user._user_turn_controller._user_turn
+    await voice.wake()
+    await voice.transcript("重新说一个完整问题。")
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert len(voice.requests) == 1
+    assert voice.requests[0]["messages"][-1]["content"] == "重新说一个完整问题。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_end_during_generation_cancels_request_and_resumes_local_standby(voice):
+    await voice.wake()
+    await voice.transcript("等待模型。")
+    await voice.wait(lambda s: bool(voice.requests))
+    voice.runtime.command("end_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    assert len(voice.requests) == 1
+    assert not voice.runtime._lifecycle.busy
+    voice.release_model.set()
+    await voice.wake()
+    await voice.transcript("改问新问题。")
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    assert len(voice.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_asr_handshake_failure_is_reported_and_text_remains_available(voice, monkeypatch):
+    async def fail_connect(*args, **kwargs):
+        raise InvalidHandshake("测试 ASR 鉴权失败")
+    monkeypatch.setattr(volcengine, "connect", fail_connect)
+    voice.runtime.command("wake_voice")
+    snapshot = await voice.wait(lambda s: s["state"]["voice_status"] == "error")
+    assert "ASR 鉴权失败" in snapshot["state"]["voice_error"]
+    assert voice.closed_audio
+    voice.runtime.send_text("继续文字交流。")
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")

@@ -98,6 +98,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
         self._candidate: _Candidate | None = None
         self._request_task: asyncio.Task | None = None
         self._register_event_handler("on_decision", sync=True)
+        self._register_event_handler("on_activity", sync=True)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Keep audio flowing while overlapping transcripts await classification."""
@@ -106,6 +107,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
             if frame.candidate is not self._candidate:
                 return
             self._request_task = None
+            await self._call_event_handler("on_activity", False)
             if frame.text == frame.candidate.text:
                 if frame.error is not None:
                     await self.push_error(
@@ -171,6 +173,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
             )
 
     async def _classify(self, candidate: _Candidate, text: str) -> None:
+        await self._call_event_handler("on_activity", True)
         started = time.perf_counter()
         result = _ClassificationResultFrame(candidate=candidate, text=text)
         try:
@@ -233,6 +236,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
         self._request_task = None
         if task is not None:
             await self.cancel_task(task)
+            await self._call_event_handler("on_activity", False)
 
     async def cleanup(self) -> None:
         """Cancel the session's outstanding classification before cleanup."""

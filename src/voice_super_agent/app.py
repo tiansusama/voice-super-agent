@@ -10,6 +10,7 @@ import webview
 from voice_super_agent.runtime import Runtime
 from voice_super_agent.desktop.host import Desktop
 from voice_super_agent.desktop.instance import SingleInstance
+from voice_super_agent.voice.wake import MODEL_NAME
 
 
 # 从开发工作副本的 src 布局定位前端产物和本地数据。
@@ -57,7 +58,8 @@ def main() -> None:
             ],
         )
 
-        runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3")
+        runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3",
+                          wake_model_dir=PROJECT_ROOT / "resources" / "models" / MODEL_NAME)
         runtime.start()
         try:
             desktop = Desktop(runtime, page)

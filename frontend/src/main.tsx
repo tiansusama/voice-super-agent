@@ -90,6 +90,8 @@ function App() {
   const state = snapshot.state;
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceBusy;
+  const voiceLabel = {off: '语音未启动', standby: '待唤醒', starting: '正在准备', active: '语音交互中', stopping: '正在结束', error: '语音不可用'}[state.voice_status];
+  const activityLabel = {listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管', thinking: '正在思考', speaking: '正在播报'}[state.voice_activity];
   const symbol = <span className="wave-symbol" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
 
   if (view === 'floating') {
@@ -131,9 +133,20 @@ function App() {
         <div className="chat-status" role="status" aria-live="polite">
           <span className={`status-dot ${canSend ? 'ready' : ''}`} />
           {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
-            voiceBusy ? '语音联调中 · 停止语音后可发送文字' :
+            voiceBusy ? '语音交互中 · 结束语音后可发送文字' :
             state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
         </div>
+        <div className="voice-controls">
+          <div role="status" aria-live="polite">
+            <span>{voiceLabel}{state.voice_status === 'active' && ` · ${activityLabel}`}</span>
+            {state.voice_status === 'standby' && <small>说“{state.wake_word}”或按住 {state.wake_hotkey} 一秒，听到叮声后说话</small>}
+          </div>
+          {state.voice_status === 'starting' || state.voice_status === 'active' ?
+            <button onClick={() => void command('end_voice')} disabled={state.exiting}>结束语音</button> :
+            <button onClick={() => void command('wake_voice')}
+              disabled={voiceBusy || !!state.storage_error || state.exiting || !state.model_available}>唤醒语音</button>}
+        </div>
+        {state.voice_error && <p role="alert" className="model-error">{state.voice_error}</p>}
         {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
         {state.storage_error && <p role="alert" className="model-error">{state.storage_error}</p>}
         <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
@@ -174,17 +187,7 @@ function App() {
       </section>
       {state.desktop_check && <section className="desktop-check">
         <h2>桌面联调</h2>
-        <p>语音联调使用默认音频设备。请佩戴耳机，开始后直接说话；停止语音后可继续文字交流。</p>
-        <div className="check-status" role="status">语音：{{off: '未启动', starting: '正在准备', active: '已启动', stopping: '正在停止', error: '不可用'}[state.voice_status]}
-          {state.voice_status === 'active' && ` · ${{listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管', thinking: '正在思考', speaking: '正在播报'}[state.voice_activity]}`}
-        </div>
-        {state.voice_error && <p role="alert" className="error">{state.voice_error}</p>}
-        <div className="actions">
-          <button onClick={() => void command('start_voice')}
-            disabled={voiceBusy || !!state.storage_error || state.exiting || !state.model_available}>开始语音联调</button>
-          <button onClick={() => void command('stop_voice')}
-            disabled={state.voice_status !== 'active' || state.exiting}>停止语音联调</button>
-        </div>
+        <p>语音使用默认音频设备，当前先以耳机环境联调。待唤醒时检测本地唤醒词，唤醒后连接 ASR；听到叮声后再说指令。</p>
         <p>真实后台任务每秒推送 20 次状态，可在窗口隐藏或重载后继续查看。</p>
         <div className="check-status">后台计数 <output>{state.activity_tick}</output> · 状态序号 {snapshot.sequence}</div>
         <div className="actions">

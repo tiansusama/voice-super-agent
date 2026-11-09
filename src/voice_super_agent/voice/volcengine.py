@@ -2,6 +2,7 @@
 
 # 来源：STS 的 local_volcengine_services.py，基于 Pipecat de8998789 迁入后独立维护。
 
+import asyncio
 import base64
 import gzip
 import json
@@ -32,7 +33,7 @@ from pipecat.utils.time import time_now_iso8601
 class VolcengineSTTService(STTService):
     """Publish Volcengine streaming transcripts as Pipecat frames."""
 
-    def __init__(self, *, api_key: str):
+    def __init__(self, *, api_key: str, defer_connection: bool = False):
         """Initialize the ASR adapter.
 
         Args:
@@ -43,16 +44,28 @@ class VolcengineSTTService(STTService):
             settings=STTSettings(model="bigmodel", language=Language.ZH),
         )
         self._api_key = api_key
+        self._defer_connection = defer_connection
+        self._register_event_handler("on_recognition", sync=True)
         self._socket: ClientConnection | None = None
         self._receive_task = None
         self._sequence = 1
         self._audio = bytearray()
         self._final_end_ms = -1
         self._interim_text = ""
+        self._ready = asyncio.Event()
 
     async def setup(self, setup: FrameProcessorSetup):
-        """Open the provider connection for this pipeline worker."""
+        """准备处理器；常驻语音宿主在唤醒时建立云端连接。"""
         await super().setup(setup)
+        if not self._defer_connection:
+            await self.connect()
+
+    async def connect(self):
+        self._ready.clear()
+        self._sequence = 1
+        self._audio.clear()
+        self._final_end_ms = -1
+        self._interim_text = ""
         self._socket = await connect(
             "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
             additional_headers={
@@ -84,6 +97,16 @@ class VolcengineSTTService(STTService):
             ).encode(),
         )
         self._receive_task = self.create_task(self._receive_results(), name="volcengine-stt")
+        ready = asyncio.create_task(self._ready.wait())
+        try:
+            async with asyncio.timeout(10):
+                done, _ = await asyncio.wait((ready, self._receive_task), return_when=asyncio.FIRST_COMPLETED)
+                if self._receive_task in done:
+                    await self._receive_task
+                    raise RuntimeError("云端 ASR 在确认就绪前结束连接。")
+        finally:
+            ready.cancel()
+            await asyncio.gather(ready, return_exceptions=True)
 
     async def _send_packet(self, message_type: int, payload: bytes):
         compressed = gzip.compress(payload)
@@ -96,6 +119,9 @@ class VolcengineSTTService(STTService):
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Send PCM while the receive task publishes transcripts."""
+        if self._socket is None:
+            yield None
+            return
         self._audio.extend(audio)
         # 火山建议每包发送 200 毫秒，Pipecat 负责输入音频重采样。
         while len(self._audio) >= 6400:
@@ -123,6 +149,7 @@ class VolcengineSTTService(STTService):
                 response = json.loads(payload)
                 if response.get("code", 0) not in (0, 20000000):
                     raise RuntimeError(f"Volcengine ASR returned error code {response['code']}")
+                self._ready.set()
                 result = response.get("result", {})
                 interim = []
                 # definite 只表示识别分句定稿；用户轮次由 Pipecat 的策略决定。
@@ -147,13 +174,14 @@ class VolcengineSTTService(STTService):
                             text, self._user_id, time_now_iso8601(), Language.ZH
                         )
                     )
+                await self._call_event_handler("on_recognition", bool(text))
             raise RuntimeError("Volcengine ASR connection ended")
         except (WebSocketException, OSError, RuntimeError, json.JSONDecodeError) as exc:
             await self.push_error(
                 error_msg=str(exc), exception=exc, force_treat_as_permanent=True
             )
 
-    async def _close_connection(self):
+    async def disconnect(self):
         if self._receive_task is not None:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
@@ -164,16 +192,16 @@ class VolcengineSTTService(STTService):
     async def stop(self, frame: EndFrame):
         """Close ASR when the pipeline ends."""
         await super().stop(frame)
-        await self._close_connection()
+        await self.disconnect()
 
     async def cancel(self, frame: CancelFrame):
         """Close ASR when the pipeline is cancelled."""
         await super().cancel(frame)
-        await self._close_connection()
+        await self.disconnect()
 
     async def cleanup(self):
         """Release the provider connection during processor cleanup."""
-        await self._close_connection()
+        await self.disconnect()
         await super().cleanup()
 
 
