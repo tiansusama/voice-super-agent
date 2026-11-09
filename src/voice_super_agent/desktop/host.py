@@ -177,8 +177,10 @@ class Desktop:
         from System.Windows.Forms import FormWindowState
 
         if command == "quit":
+            if not self.runtime.prepare_exit():
+                self.activate()
+                return True
             self._quitting = True
-            self.runtime.command("stop_activity")
             self.runtime.disconnect("main")
             self.runtime.disconnect("floating")
             self._gui(self._close_windows)

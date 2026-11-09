@@ -88,6 +88,7 @@ function App() {
 
   if (!snapshot || !view) return <main><p role="status">{error || '正在连接桌面…'}</p></main>;
   const state = snapshot.state;
+  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting;
   const symbol = <span className="wave-symbol" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
 
   if (view === 'floating') {
@@ -127,10 +128,12 @@ function App() {
       </header>
       <section className="chat-panel">
         <div className="chat-status" role="status" aria-live="polite">
-          <span className={`status-dot ${state.model_available ? 'ready' : ''}`} />
-          {state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
+          <span className={`status-dot ${canSend ? 'ready' : ''}`} />
+          {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
+            state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
         </div>
         {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
+        {state.storage_error && <p role="alert" className="model-error">{state.storage_error}</p>}
         <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
           onScroll={event => {
             const element = event.currentTarget;
@@ -153,15 +156,15 @@ function App() {
         <form className="composer" onSubmit={event => { event.preventDefault(); void sendText(); }}>
           <label className="sr-only" htmlFor="message-input">输入消息</label>
           <textarea id="message-input" placeholder="输入消息，Enter 发送，Shift + Enter 换行"
-            value={draft} disabled={!state.model_available} rows={2}
+            value={draft} disabled={!canSend} rows={2}
             onChange={event => setDraft(event.target.value)}
             onKeyDown={event => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
                 event.preventDefault();
-                if (state.model_available) void sendText();
+                if (canSend) void sendText();
               }
             }} />
-          <button type="submit" disabled={!state.model_available || !draft.trim() || sending}>
+          <button type="submit" disabled={!canSend || !draft.trim() || sending}>
             {sending ? '发送中…' : '发送'}
           </button>
         </form>
@@ -178,7 +181,7 @@ function App() {
           <button onClick={() => void command('preview_floating')}>预览悬浮宿主</button>
         </div>
       </section>}
-      <footer>关闭窗口后继续在托盘中运行 · 当前对话在本次运行期间保留</footer>
+      <footer>关闭窗口后继续在托盘中运行 · {state.storage_status === 'saved' ? '对话已保存在本机' : state.storage_status === 'saving' ? '正在保存对话…' : '对话保存异常'}</footer>
     </main>
   );
 }

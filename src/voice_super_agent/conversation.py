@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
 
 from httpx2 import InvalidURL
 from openai import AsyncOpenAI
@@ -36,8 +37,9 @@ class TextDeepSeekService(DeepSeekLLMService):
 class TextConversation:
     """原生聚合器独占模型上下文，展示事件绑定当前回复。"""
 
-    def __init__(self, api_key: str, model: str, base_url: str, emit: Callable[[dict], None]):
-        self.context = LLMContext()
+    def __init__(self, api_key: str, model: str, base_url: str, emit: Callable[[dict], None],
+                 messages: list[dict] | None = None):
+        self.context = LLMContext(messages=messages)
         self._emit = emit
         self._reply_id: str | None = None
         self._interrupted = False
@@ -84,14 +86,17 @@ class TextConversation:
         async def on_processed(aggregator, frame):
             if isinstance(frame, LLMFullResponseStartFrame):
                 self._reply_open = True
+                self._emit({"type": "context", "reply_id": self._reply_id,
+                            "messages": deepcopy(self.context.get_messages())})
                 self._started.set()
             elif isinstance(frame, (LLMFullResponseEndFrame, InterruptionFrame, CancelFrame)) and self._reply_open:
                 # 同步帧事件发生于原生上下文提交之后，关联仍属于刚完成的回复。
                 self._reply_open = False
-                status = "failed" if self._failed else (
+                status = "failed" if self._failed else "unfinished" if self._closing else (
                     "interrupted" if self._interrupted or isinstance(frame, (InterruptionFrame, CancelFrame)) else "completed"
                 )
-                self._emit({"type": "finished", "reply_id": self._reply_id, "status": status})
+                self._emit({"type": "finished", "reply_id": self._reply_id, "status": status,
+                            "messages": deepcopy(self.context.get_messages())})
 
         @self._llm.event_handler("on_error")
         async def on_model_error(service, error):
@@ -152,3 +157,7 @@ class TextConversation:
         if self._runner_task is not None:
             await self._runner.cancel()
             await self._runner_task
+            if self._reply_id is not None:
+                # 输入可能已进入原生上下文、但助手尚未开始；退出后再采集最终提交。
+                self._emit({"type": "context", "reply_id": self._reply_id,
+                            "messages": deepcopy(self.context.get_messages())})

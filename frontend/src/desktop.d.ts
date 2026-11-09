@@ -13,6 +13,9 @@ interface DesktopSnapshot {
     model_error: string;
     model: string;
     active_reply_id: string | null;
+    storage_status: 'saving' | 'saved' | 'error';
+    storage_error: string;
+    exiting: boolean;
   };
 }
 
@@ -22,7 +25,7 @@ interface ChatMessage {
   source: 'text';
   reply_id: string;
   text: string;
-  status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed';
+  status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed' | 'unfinished';
   created_at: string;
   error: string;
 }

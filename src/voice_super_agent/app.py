@@ -57,7 +57,7 @@ def main() -> None:
             ],
         )
 
-        runtime = Runtime(desktop_check=args.desktop_check)
+        runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3")
         runtime.start()
         try:
             desktop = Desktop(runtime, page)
