@@ -76,6 +76,10 @@ class VoiceHarness:
         self.asr_ready.set()
         self.ending = False
         self.silent_ending = False
+        self.failures = {}
+        self.tts_requests = []
+        self.fail_model_after_text = False
+        self.hold_model_after_text = False
 
     async def recognize(self, request):
         self.asr = web.WebSocketResponse()
@@ -98,10 +102,15 @@ class VoiceHarness:
     async def classify(self, request):
         self.classifications.append(await request.json())
         await self.release_classifier.wait()
+        if "system_one" in self.failures:
+            return web.json_response({"error": "测试判意服务失败"}, status=self.failures["system_one"])
         return web.json_response({"answers": {"interruption_intent": {"choice": self.decision}}})
 
     async def synthesize(self, request):
         self.tts_request = await request.json()
+        self.tts_requests.append(self.tts_request)
+        if "tts" in self.failures:
+            return web.json_response({"error": "测试合成服务失败"}, status=self.failures["tts"])
         events = [{"code": 0, "data": base64.b64encode(b"\x01\x00" * 4800).decode()},
                   {"code": 20000000}]
         return web.Response(body=b"".join(json.dumps(event).encode() + b"\n" for event in events))
@@ -109,6 +118,9 @@ class VoiceHarness:
     async def complete(self, request):
         payload = await request.json()
         self.requests.append(payload)
+        if "model" in self.failures:
+            return web.json_response({"error": {"message": "测试模型服务失败", "type": "test_error"}},
+                                     status=self.failures["model"])
         self.ending = payload["messages"][-1]["role"] == "tool"
         if payload["messages"][-1]["content"] == "等待模型。":
             await self.release_model.wait()
@@ -127,6 +139,11 @@ class VoiceHarness:
                 chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
                          "model": "test-model", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
                 await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+                if self.fail_model_after_text:
+                    request.transport.close()
+                    return response
+                if self.hold_model_after_text:
+                    await self.release_model.wait()
             await response.write(b"data: [DONE]\n\n")
         except ConnectionResetError:
             pass

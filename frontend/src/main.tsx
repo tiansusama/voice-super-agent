@@ -59,14 +59,17 @@ function App() {
     }
   }, [snapshot]);
 
-  async function sendText() {
+  async function sendText(originalMessageId?: string) {
     const text = draft.trim();
-    if (!text || sendingRef.current) return;
+    if ((!originalMessageId && !text) || sendingRef.current) return;
     sendingRef.current = true;
     setSending(true);
     try {
-      await window.pywebview!.api.send_text(text);
-      setDraft(current => current === draft ? '' : current);
+      if (originalMessageId) await window.pywebview!.api.resend_text(originalMessageId);
+      else {
+        await window.pywebview!.api.send_text(text);
+        setDraft(current => current === draft ? '' : current);
+      }
       followLatest.current = true;
       setError('');
     } catch (reason) {
@@ -91,8 +94,14 @@ function App() {
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
   const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceSwitching;
+  const failedReplies = new Set(snapshot.messages.filter(message => message.role === 'assistant' && message.status === 'failed')
+    .map(message => message.id));
   const voiceLabel = {off: '语音未启动', standby: '待唤醒', starting: '正在准备', active: '语音交互中', stopping: '正在结束', error: '语音不可用'}[state.voice_status];
   const activityLabel = {listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管', thinking: '正在思考', speaking: '正在播报'}[state.voice_activity];
+  const latestVoiceQuestion = snapshot.messages.filter(message => message.role === 'user' && message.source === 'voice'
+    && message.status !== 'backchannel').at(-1);
+  const latestVoiceReply = snapshot.messages.find(message => message.id === latestVoiceQuestion?.reply_id);
+  const capabilityError = state.voice_error || state.model_error;
   const symbol = <span className="wave-symbol" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
 
   if (view === 'floating') {
@@ -100,22 +109,29 @@ function App() {
       <div className="floating-host">
         {state.preview_expanded && <section className="floating-card">
           <header>
-            <span>悬浮宿主联调</span>
+            <span>{voiceLabel}</span>
             <button onClick={() => void command('hide_floating')} aria-label="隐藏收音窗">×</button>
           </header>
           <div className="floating-scroll" tabIndex={0}>
-            <p className="preview-question">验证圆角卡片、圆球与中间的穿透区域。</p>
+            <p className="preview-question">{latestVoiceQuestion?.text || '等待你开始交流'}</p>
             <div className="preview-answer">
-              <p>这里显示窗口联调说明。真实语音和问答内容在后续阶段接入。</p>
-              <p>后台计数：<output>{state.activity_tick}</output></p>
-              <p>此区域可以滚动，按钮可以点击。打开主窗口后，悬浮组件收起。</p>
-              <p>关闭只隐藏悬浮组件，后台继续运行。</p>
+              {latestVoiceReply?.text && <p>{latestVoiceReply.text}</p>}
+              {capabilityError && <p className="message-error" role="alert">{capabilityError}</p>}
+              {!capabilityError && latestVoiceReply?.error && <p className="message-error" role="alert">{latestVoiceReply.error}</p>}
+              {state.voice_recovery === 'running' && <p role="status">正在恢复语音…</p>}
+              {state.voice_recovery === 'succeeded' && state.voice_status === 'standby' &&
+                <p role="status">语音已恢复，等待再次唤醒。</p>}
             </div>
           </div>
-          <button className="open-main" onClick={() => void command('show_main')}>打开主窗口</button>
+          <div className="floating-actions">
+            {state.voice_status === 'error' && <button className="open-main" onClick={() => void command('recover_voice')}
+              disabled={!state.model_available || !!state.storage_error || state.exiting}>恢复语音</button>}
+            <button className="open-main" onClick={() => void command('show_main')}>打开主窗口</button>
+          </div>
         </section>}
-        <button className="floating-orb" onClick={() => void command('toggle_preview_card')}
-          aria-label={state.preview_expanded ? '收起联调卡片' : '展开联调卡片'}>{symbol}</button>
+        <button className={`floating-orb ${capabilityError ? 'has-error' : ''}`} onClick={() => void command('toggle_preview_card')}
+          title={capabilityError || voiceLabel}
+          aria-label={`${voiceLabel}，${state.preview_expanded ? '收起卡片' : '展开卡片'}`}>{symbol}</button>
         {error && <div role="alert" className="floating-error">{error}</div>}
       </div>
     );
@@ -149,6 +165,9 @@ function App() {
               {state.voice_status === 'error' ? '恢复语音' : '唤醒语音'}</button>}
         </div>
         {state.voice_error && <p role="alert" className="model-error">{state.voice_error}</p>}
+        {state.voice_recovery === 'running' && <p role="status" className="recovery-status">正在恢复语音…</p>}
+        {state.voice_recovery === 'succeeded' && state.voice_status === 'standby' &&
+          <p role="status" className="recovery-status">语音已恢复，等待再次唤醒。</p>}
         {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
         {state.storage_error && <p role="alert" className="model-error">{state.storage_error}</p>}
         <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
@@ -169,6 +188,9 @@ function App() {
             {message.status === 'thinking' && <span className="message-progress">正在思考…</span>}
             {message.status === 'streaming' && <span className="message-progress">{message.role === 'user' ? '正在识别…' : '正在回复…'}</span>}
             {message.error && <p className="message-error" role="alert">{message.error}</p>}
+            {message.role === 'user' && message.source === 'text' && failedReplies.has(message.reply_id) &&
+              <button className="resend-message" disabled={!canSend || sending}
+                onClick={() => void sendText(message.id)}>重新发送</button>}
           </article>)}
         </div>
         <form className="composer" onSubmit={event => { event.preventDefault(); void sendText(); }}>

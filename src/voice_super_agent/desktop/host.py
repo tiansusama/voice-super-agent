@@ -37,6 +37,9 @@ class DesktopApi:
     def send_text(self, text: str):
         return self._runtime.send_text(text)
 
+    def resend_text(self, user_message_id: str):
+        return self._runtime.resend_text(user_message_id)
+
 
 class Desktop:
     """管理窗口与托盘；独立发送线程承接阻塞的 WebView 脚本调用。"""
@@ -81,15 +84,19 @@ class Desktop:
         self._tray = NotifyIcon()
         self._tray.Icon = form.Icon
         self._tray.Text = "小博 · 后台运行"
+        self._tray_status = ("小博 · 后台运行", False)
         menu = ContextMenuStrip()
         show = ToolStripMenuItem("显示主窗口")
         show.Click += lambda *_: self.activate()
         self._show_floating = ToolStripMenuItem("显示收音窗")
         self._show_floating.Enabled = False
         self._show_floating.Click += lambda *_: self.runtime.command("preview_floating")
+        self._recover_voice = ToolStripMenuItem("恢复语音")
+        self._recover_voice.Enabled = False
+        self._recover_voice.Click += lambda *_: self.runtime.command("recover_voice")
         quit_item = ToolStripMenuItem("退出应用")
         quit_item.Click += lambda *_: self.runtime.command("quit")
-        for item in (show, self._show_floating, quit_item):
+        for item in (show, self._show_floating, self._recover_voice, quit_item):
             menu.Items.Add(item)
         self._tray.ContextMenuStrip = menu
         self._tray.DoubleClick += lambda *_: self.activate()
@@ -244,6 +251,18 @@ class Desktop:
                     pending.append(following)
                     break
                 event = following
+            state = event["snapshot"]["state"]
+            tray_status = ("小博 · 模型不可用" if not state["model_available"] else
+                           "小博 · 正在恢复语音" if state["voice_recovery"] == "running" else
+                           "小博 · 语音不可用" if state["voice_status"] == "error" else "小博 · 后台运行")
+            can_recover = (state["voice_status"] == "error" and state["model_available"]
+                           and not state["storage_error"] and not state["exiting"])
+            if (tray_status, can_recover) != self._tray_status:
+                self._tray_status = (tray_status, can_recover)
+                def update_tray(status=tray_status, can_recover=can_recover):
+                    self._tray.Text = status
+                    self._recover_voice.Enabled = can_recover
+                self._gui(update_tray)
             script = "window.dispatchEvent(new CustomEvent('agent-state', {detail: " + json.dumps(event["snapshot"]) + "}))"
             for view in event["views"]:
                 window = self.main if view == "main" else self.floating

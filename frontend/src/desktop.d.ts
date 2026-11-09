@@ -28,6 +28,15 @@ interface DesktopSnapshot {
     playback_device: string;
     audio_device_pending: boolean;
     playback_stop_ms: number;
+    last_error: {
+      service: string;
+      category: string;
+      permanent: boolean;
+      message: string;
+      reply_id: string | null;
+      source: 'text' | 'voice' | null;
+    } | null;
+    voice_recovery: 'idle' | 'running' | 'succeeded' | 'failed';
   };
 }
 
@@ -52,6 +61,7 @@ interface Window {
       connect(): Promise<DesktopConnection>;
       command(name: string): Promise<void>;
       send_text(text: string): Promise<{ user_message_id: string; reply_id: string }>;
+      resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string }>;
     };
   };
 }

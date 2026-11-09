@@ -87,6 +87,8 @@ class Runtime:
             "playback_device": "",
             "audio_device_pending": False,
             "playback_stop_ms": 0.0,
+            "last_error": None,
+            "voice_recovery": "idle",
         }
 
     def start(self) -> None:
@@ -146,6 +148,17 @@ class Runtime:
     def send_text(self, text: str) -> dict[str, str]:
         return asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop).result()
 
+    def resend_text(self, user_message_id: str) -> dict[str, str]:
+        return asyncio.run_coroutine_threadsafe(self._resend_text(user_message_id), self._loop).result()
+
+    async def _resend_text(self, user_message_id: str) -> dict[str, str]:
+        message = self._messages[user_message_id]
+        if (message["role"] != "user" or message["source"] != "text"
+                or self._messages[message["reply_id"]]["status"] != "failed"):
+            raise ValueError("只能重新发送回答失败的文字消息。")
+        # 从后台原消息读取正文，沿普通发送路径追加新输入并执行接管。
+        return await self._send_text(message["text"])
+
     async def _send_text(self, text: str) -> dict[str, str]:
         text = text.strip()
         if not text:
@@ -185,47 +198,71 @@ class Runtime:
         try:
             while True:
                 reply_id, text, epoch = await self._inputs.get()
+                if self._messages[reply_id]["status"] == "failed":
+                    continue
                 async with self._execution_lock:
-                    if self._conversation is not None and self._conversation._runner_task.done():
-                        await self._conversation.close()
-                        self._conversation = None
-                    if self._conversation is None:
-                        self._conversation = self._create_conversation(voice=False)
-                        await self._conversation.start()
-                    await self._conversation.send(reply_id, text, voice_epoch=epoch)
-        except (RuntimeError, TimeoutError, ValueError) as exc:
-            logger.exception("文字输入处理失败")
-            self._conversation_event({"type": "unavailable", "error": str(exc)})
-            if self._conversation is not None:
-                await self._conversation.close()
+                    try:
+                        if self._conversation is not None and (self._conversation._runner_task.done()
+                                or (self._conversation.voice_enabled and self._state["voice_status"] == "error")):
+                            await self._conversation.close()
+                            self._conversation = None
+                        if self._conversation is None:
+                            self._conversation = self._create_conversation(voice=False)
+                            await self._conversation.start()
+                        await self._conversation.send(reply_id, text, voice_epoch=epoch)
+                    except (RuntimeError, TimeoutError, ValueError) as exc:
+                        logger.exception("文字输入处理失败")
+                        if isinstance(exc, ValueError):
+                            self._update({"model_available": False, "model_error": str(exc) + "。请检查模型配置后重启应用。"})
+                        self._conversation_event({"type": "unavailable", "error": str(exc), "reply_ids": (reply_id,),
+                                                  "voice": self._conversation is not None and self._conversation.voice_enabled})
+                        if self._conversation is not None:
+                            await self._conversation.close()
+                            self._conversation = None
+                        # 清理期间已接收的新输入继续由本消费者处理。
+        finally:
+            self._input_task = None
 
     def _create_conversation(self, voice: bool) -> Conversation:
-        return Conversation(
-            self._api_key, self._state["model"], self._base_url, self._conversation_event,
+        def emit(event):
+            # 关闭已等待旧执行对象清理；回调的归属仍以实际对象为准。
+            if self._conversation is conversation:
+                self._conversation_event(event)
+
+        conversation = Conversation(
+            self._api_key, self._state["model"], self._base_url, emit,
             messages=deepcopy([record["message"] for record in self._model_records[self._window["model_start_position"]:]]),
             voice=voice,
         )
+        return conversation
 
-    async def _close_conversation(self) -> None:
+    async def _close_conversation(self, *, interrupted: bool = False) -> None:
         if self._input_task is not None:
             self._input_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._input_task
             self._input_task = None
         if self._conversation is not None:
-            await self._conversation.close()
+            if interrupted:
+                await self._conversation.close(interrupted=True)
+            else:
+                await self._conversation.close()
             self._conversation = None
         while not self._inputs.empty():
             self._inputs.get_nowait()
         for message in self._messages.values():
             if message["status"] in {"queued", "thinking", "streaming"}:
-                message["status"] = "unfinished"
+                message["status"] = "interrupted" if interrupted and message["role"] == "assistant" else "unfinished"
         self._update({"active_reply_id": None})
         self._request_save(immediate=True)
 
-    async def _set_voice(self, enabled: bool) -> None:
+    async def _set_voice(self, enabled: bool, *, recovering: bool = False) -> None:
         async with self._execution_lock:
             try:
+                if recovering:
+                    # 用户恢复先提交文字回复的已有片段，旧对象释放后再建立待唤醒宿主。
+                    await self._close_conversation(interrupted=True)
+                    self._lifecycle.deactivate()
                 if self._wake_model_dir is not None:
                     if not self._state["storage_error"] and (
                             self._conversation is None or not self._conversation.voice_enabled
@@ -261,24 +298,33 @@ class Runtime:
                         self._request_save(immediate=True)
                         self._update({"voice_status": "error" if self._state["storage_error"] else "standby",
                                       "voice_error": self._state["storage_error"], "voice_activity": "listening", "active_reply_id": None})
+                    if recovering:
+                        self._update({"voice_recovery": "failed" if self._state["storage_error"] else "succeeded"})
                     return
-                await self._close_conversation()
-                if enabled:
+                if not recovering:
+                    await self._close_conversation()
+                if enabled or recovering:
                     # 切换执行对象前完成已有提交的事务，保存失败时保留文字与窗口。
                     if not await self._flush():
-                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"]})
+                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"],
+                                      "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
                         return
                     self._conversation = self._create_conversation(voice=True)
                     await self._conversation.start()
                     if self._state["storage_error"]:
                         await self._close_conversation()
-                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"]})
+                        self._update({"voice_status": "error", "voice_error": self._state["storage_error"],
+                                      "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
                         return
-                    await self._conversation.activate_voice()
-                    self._lifecycle.activate(self._loop.time())
+                    if enabled:
+                        await self._conversation.activate_voice()
+                        self._lifecycle.activate(self._loop.time())
+                    else:
+                        self._conversation._voice.gate.mode = "standby"
                 else:
                     self._lifecycle.deactivate()
-                self._update({"voice_status": "active" if enabled else "off", "voice_activity": "listening"})
+                self._update({"voice_status": "standby" if recovering else "active" if enabled else "off", "voice_activity": "listening",
+                              "voice_error": "", "voice_recovery": "succeeded" if recovering else self._state["voice_recovery"]})
             except asyncio.CancelledError:
                 if self._conversation is not None:
                     await self._conversation.close()
@@ -290,7 +336,8 @@ class Runtime:
                 if self._conversation is not None:
                     await self._conversation.close()
                     self._conversation = None
-                self._update({"voice_status": "error", "voice_error": f"语音启动失败：{exc}"})
+                self._update({"voice_status": "error", "voice_error": f"语音启动失败：{exc}",
+                              "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
 
     async def _prepare_voice_conversation(self):
         if self._detector is None:
@@ -356,6 +403,9 @@ class Runtime:
                     with suppress(asyncio.CancelledError):
                         await self._voice_task
                 async with self._execution_lock:
+                    self._conversation_event({"type": "error", "reply_id": self._state["active_reply_id"],
+                                              "error": str(exc), "service": "audio", "category": "connectivity",
+                                              "permanent": True, "voice": True})
                     await self._close_conversation()
                     self._lifecycle.deactivate()
                     self._update({"voice_status": "error", "voice_error": str(exc), "active_reply_id": None,
@@ -397,6 +447,26 @@ class Runtime:
         if event["type"] == "voice_error":
             self._update({"voice_error": event["error"]})
             return
+        if event["type"] == "error":
+            reply_id = event["reply_id"]
+            message = self._messages[reply_id] if reply_id is not None else None
+            failed_reply = message is not None and message["status"] in {"queued", "thinking", "streaming"}
+            if failed_reply:
+                message.update(status="failed", error=event["error"])
+                self._lifecycle.activity(f"reply:{reply_id}", False, self._loop.time())
+            changes = {"last_error": {"service": event["service"], "category": event["category"],
+                                      "permanent": event["permanent"], "message": event["error"],
+                                      "reply_id": reply_id if failed_reply else None,
+                                      "source": message["source"] if failed_reply else None}}
+            if event["service"] == "model" and event["permanent"]:
+                changes.update(model_available=False, model_error=event["error"] + "。请检查模型配置后重启应用。")
+            elif event["voice"] and event["service"] != "model":
+                changes["voice_error"] = event["error"]
+            if self._state["active_reply_id"] == reply_id:
+                changes["active_reply_id"] = None
+            self._request_save(immediate=True)
+            self._update(changes)
+            return
         if event["type"] in {"voice_input", "voice_committed", "voice_unfinished", "backchannel"}:
             reply_id = event["reply_id"]
             backchannel = event["type"] == "backchannel"
@@ -426,14 +496,14 @@ class Runtime:
             return
         if event["type"] == "unavailable":
             for message in self._messages.values():
-                if message["status"] in {"queued", "thinking", "streaming"}:
+                if (message["reply_id"] in event["reply_ids"] or not self._state["model_available"]) and message["status"] in {"queued", "thinking", "streaming"}:
                     message.update(status="failed", error=event["error"])
             self._request_save(immediate=True)
             if event.get("voice", False):
                 self._lifecycle.deactivate()
                 self._update({"voice_status": "error", "voice_error": self._state["voice_error"] or event["error"], "active_reply_id": None})
             else:
-                self._update({"model_available": False, "model_error": event["error"], "active_reply_id": None})
+                self._update({"active_reply_id": None})
             return
         if event["type"] == "context":
             self._capture_context(event["messages"], event["reply_id"])
@@ -448,10 +518,10 @@ class Runtime:
             message["status"] = "thinking"
             changes["active_reply_id"] = message["id"]
         elif event["type"] == "text":
+            if message["status"] in {"failed", "interrupted", "unfinished", "completed"}:
+                return
             message["text"] += event["text"]
             message["status"] = "streaming"
-        elif event["type"] == "error":
-            message.update(status="failed", error=event["error"])
         elif event["type"] == "finished":
             self._lifecycle.activity(f"reply:{event['reply_id']}", False, self._loop.time())
             self._lifecycle.finished_reply = event["reply_id"]
@@ -574,13 +644,19 @@ class Runtime:
                 with suppress(asyncio.CancelledError):
                     await self._voice_task
             if enabled or recovering:
+                if not self._state["model_available"]:
+                    self._update({"voice_status": "error", "voice_error": self._state["model_error"],
+                                  "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
+                    return
                 try:
                     self._require_voice_configuration()
                 except ValueError as exc:
-                    self._update({"voice_status": "error", "voice_error": str(exc)})
+                    self._update({"voice_status": "error", "voice_error": str(exc),
+                                  "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
                     return
-            self._update({"voice_status": "starting" if enabled or recovering else "stopping", "voice_error": ""})
-            self._voice_task = asyncio.create_task(self._set_voice(enabled), name="switch-voice")
+            self._update({"voice_status": "starting" if enabled or recovering else "stopping", "voice_error": "",
+                          "voice_recovery": "running" if recovering else self._state["voice_recovery"]})
+            self._voice_task = asyncio.create_task(self._set_voice(enabled, recovering=recovering), name="switch-voice")
         else:
             raise ValueError(f"未知桌面命令：{command}")
 

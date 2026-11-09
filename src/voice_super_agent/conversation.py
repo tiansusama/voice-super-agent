@@ -72,6 +72,7 @@ class Conversation:
         self._failure_reason = ""
         self._reply_open = False
         self._closing = False
+        self._close_status = "unfinished"
         self._ready = asyncio.Event()
         self._started = asyncio.Event()
         self._runner_task: asyncio.Task | None = None
@@ -230,7 +231,7 @@ class Conversation:
                     return
                 # 同步帧事件发生于原生上下文提交之后，关联仍属于刚完成的回复。
                 self._reply_open = False
-                status = "failed" if self._failed else "unfinished" if self._closing else (
+                status = "failed" if self._failed else self._close_status if self._closing else (
                     "interrupted" if self._interrupted or self._assistant_reply_id != self._reply_id
                     or isinstance(frame, (InterruptionFrame, CancelFrame)) else "completed"
                 )
@@ -239,31 +240,30 @@ class Conversation:
             if self.voice_enabled and isinstance(frame, (FunctionCallResultFrame, FunctionCallCancelFrame)):
                 self._busy("tool", assistant.has_function_calls_in_progress)
 
-        @self._llm.event_handler("on_error")
-        async def on_model_error(service, error):
-            self._failed = True
-            self._failure_reason = f"模型请求失败：{error.error}"
-            self._emit({"type": "error", "reply_id": self._reply_id,
-                        "error": self._failure_reason})
+        services = {self._llm: ("model", "模型请求失败")}
+        if voice:
+            services.update({self._voice.stt: ("asr", "语音识别失败"),
+                             self._voice.interruption: ("system_one", "语音判意失败"),
+                             self._voice.tts: ("tts", "语音合成失败"),
+                             self._voice.transport.input(): ("audio", "录音设备失败"),
+                             self._voice.transport.output(): ("audio", "播放设备失败")})
 
-        @self._worker.event_handler("on_pipeline_error")
-        async def on_pipeline_error(worker, error):
-            if error.processor is not self._llm:
-                self._failed = True
-                self._emit({"type": "voice_error" if self.voice_enabled else "error", "reply_id": self._reply_id,
-                            "error": f"对话处理失败：{error.error}"})
+        async def on_service_error(processor, error):
+            service, label = services.get(processor, ("pipeline", "对话处理失败"))
+            self._failed = True
+            self._failure_reason = f"{label}：{error.error}"
+            reply_id = self._generation_reply_id if service in {"model", "tts"} else self._reply_id
+            if self._voice_pending is not None and service in {"asr", "system_one"}:
+                reply_id = self._voice_pending["reply_id"]
+            # 原生分类和可用性判定已在 on_error 前完成，保留其具体失败语义。
+            self._emit({"type": "error", "reply_id": reply_id, "error": self._failure_reason,
+                        "service": service, "category": error.category.value,
+                        "permanent": error.fatal or not processor.is_usable, "voice": self.voice_enabled})
+
+        for processor in processors:
+            processor.add_event_handler("on_error", on_service_error)
 
         if voice:
-            async def on_voice_error(processor, error):
-                self._failed = True
-                self._failure_reason = f"语音处理失败：{error.error}"
-                self._emit({"type": "voice_error", "reply_id": self._reply_id, "error": self._failure_reason})
-
-            # setup 阶段的错误也在处理器自身同步采集，保留原始设备或连接原因。
-            for processor in processors:
-                if processor is not self._llm:
-                    processor.add_event_handler("on_error", on_voice_error)
-
             @self._voice.interruption.event_handler("on_decision")
             async def on_decision(processor, text, decision):
                 self._emit({"type": "voice_activity", "activity": "speaking" if decision == "backchannel" else "recognizing"})
@@ -378,6 +378,8 @@ class Conversation:
                 await self._voice.close()
             if not self._closing:
                 self._emit({"type": "unavailable", "voice": self.voice_enabled,
+                            "reply_ids": (self._reply_id, self._generation_reply_id,
+                                          self._voice_pending["reply_id"] if self._voice_pending is not None else None),
                             "error": f"{self._failure_reason} {self._unavailable_hint}".strip()})
 
     async def _wait_until(self, event: asyncio.Event) -> None:
@@ -469,8 +471,9 @@ class Conversation:
             self._asr_resume_task = asyncio.create_task(self._resume_asr(), name="resume-asr-after-text")
             self._busy("text_handoff", False)
 
-    async def close(self) -> None:
+    async def close(self, *, interrupted: bool = False) -> None:
         self._closing = True
+        self._close_status = "interrupted" if interrupted else "unfinished"
         self._interrupted = True
         await self._stop_asr_resume()
         if self._runner_task is not None:
