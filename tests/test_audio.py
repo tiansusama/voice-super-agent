@@ -1,7 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
@@ -153,19 +153,62 @@ async def test_parallel_processor_cleanup_releases_device_resources_once(audio):
 
 
 @pytest.mark.asyncio
-async def test_capture_uses_actual_adc_time_and_routes_callback_failure_to_native_error(audio):
+async def test_capture_uses_actual_adc_time_and_routes_callback_failure_to_native_error(audio, monkeypatch):
     transport = audio.transport
     await transport.open()
     transport.input().push_audio_frame = AsyncMock()
     transport.input().push_error = AsyncMock()
     try:
         transport._capture(bytes(320), 160, {"input_buffer_adc_time": 10}, 0)
-        transport._capture(bytes(320), 160, {"input_buffer_adc_time": 10.01}, 2)
+        monkeypatch.setattr(transport._echo, "capture", Mock(side_effect=RuntimeError("音频处理失败")))
+        assert transport._capture(bytes(320), 160, {"input_buffer_adc_time": 10.01}, 0)[1] == module.pyaudio.paAbort
         await asyncio.sleep(.01)
         assert transport.input().push_audio_frame.await_count == 1
         frame = transport.input().push_audio_frame.call_args.args[0]
         assert frame.sample_rate == RATE and len(frame.audio) == 320
         assert transport.input().push_error.call_args.kwargs["force_treat_as_permanent"]
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [module.pyaudio.paInputOverflow, module.pyaudio.paInputUnderflow])
+async def test_input_buffer_flags_keep_capture_running_and_preserve_input_epoch(audio, status):
+    transport = audio.transport
+    await transport.open()
+    transport.input().push_audio_frame = AsyncMock()
+    transport.input().push_error = AsyncMock()
+    transport.input_epoch = 7
+    try:
+        result = transport._capture(bytes(320), 160, {"input_buffer_adc_time": 10}, status)
+        await asyncio.sleep(.01)
+        assert result == (None, module.pyaudio.paContinue)
+        transport.input().push_audio_frame.assert_awaited_once()
+        frame = transport.input().push_audio_frame.call_args.args[0]
+        assert frame.metadata["voice_epoch"] == 7
+        assert frame.sample_rate == RATE and len(frame.audio) == 320
+        transport.input().push_error.assert_not_awaited()
+    finally:
+        await transport.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [module.pyaudio.paOutputUnderflow, module.pyaudio.paOutputOverflow,
+                                  module.pyaudio.paPrimingOutput])
+async def test_output_buffer_flags_keep_delivery_and_actual_playback_reference(audio, status):
+    transport = audio.transport
+    await transport.open()
+    transport.output().push_error = AsyncMock()
+    try:
+        pcm = np.full(160, 1000, dtype=np.int16).tobytes()
+        write = asyncio.create_task(transport.output().write_audio_frame(OutputAudioRawFrame(pcm, RATE, 1)))
+        await asyncio.sleep(0)
+        rendered, result = transport._render(None, 160, {"output_buffer_dac_time": 10, "current_time": 10}, status)
+        assert result == module.pyaudio.paContinue
+        assert rendered == pcm
+        assert await asyncio.wait_for(write, timeout=1)
+        np.testing.assert_array_equal(transport._echo.reference(10, 160), np.full(160, 1000, dtype=np.int16))
+        transport.output().push_error.assert_not_awaited()
     finally:
         await transport.close()
 

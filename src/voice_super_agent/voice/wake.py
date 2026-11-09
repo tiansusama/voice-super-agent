@@ -1,6 +1,5 @@
 import asyncio
 import ctypes
-from dataclasses import replace
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -99,7 +98,8 @@ class WakeAudioGate(FrameProcessor):
                 if detected and self.mode == "standby":
                     self.mode = "paused"
                     self._emit({"type": "wake"})
-            frame = replace(frame, audio=bytes(len(frame.audio)))
+            # 更新静音负载时保留采集帧的输入归属与准入信息。
+            frame.audio = bytes(len(frame.audio))
         await self.push_frame(frame, direction)
 
 

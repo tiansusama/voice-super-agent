@@ -107,6 +107,8 @@ async def test_standby_pcm_only_reaches_kws_and_wake_fires_once():
     assert events == [{"type": "wake"}]
     assert detected_audio == [(pcm, 16000)]
     assert [frame.audio for frame in down if isinstance(frame, InputAudioRawFrame)] == [bytes(640), bytes(640)]
+    assert [frame.metadata["voice_epoch"] for frame in down if isinstance(frame, InputAudioRawFrame)] == [0, 0]
+    assert [frame.metadata["voice_admitted"] for frame in down if isinstance(frame, InputAudioRawFrame)] == [False, False]
 
 
 @pytest.mark.asyncio

@@ -79,8 +79,7 @@ class DesktopAudioTransport(BaseTransport):
     def _capture(self, audio, count, times, status):
         epoch = self.input_epoch
         try:
-            if status:
-                raise OSError(f"录音设备回调异常，状态码 {status}")
+            # 回调状态位描述缓冲欠载或溢出，继续处理当前块。
             clean = self._echo.capture(audio, times["input_buffer_adc_time"])
             self._loop.call_soon_threadsafe(self._levels, audio_level(clean), None)
             frame = InputAudioRawFrame(clean, RATE, 1)
@@ -93,11 +92,7 @@ class DesktopAudioTransport(BaseTransport):
             return None, pyaudio.paAbort
 
     def _render(self, audio, count, times, status):
-        if status:
-            error = OSError(f"播放设备回调异常，状态码 {status}")
-            asyncio.run_coroutine_threadsafe(self._output.push_error(
-                error_msg=str(error), exception=error, force_treat_as_permanent=True), self._loop)
-            return bytes(count * 2), pyaudio.paAbort
+        # 缓冲欠载后继续交付音频，设备失效由端点与流状态检查处理。
         data = bytearray(count * 2)
         copied = 0
         completed = []
