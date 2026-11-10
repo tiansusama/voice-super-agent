@@ -40,6 +40,8 @@ interface DesktopSnapshot {
     history_status: 'idle' | 'reading' | 'found' | 'not_found' | 'needs_clarification' | 'invalid_arguments' | 'failed' | 'cancelled';
     history_reply_id: string | null;
     history_error: string;
+    restarting: boolean;
+    exit_error: string;
   };
 }
 

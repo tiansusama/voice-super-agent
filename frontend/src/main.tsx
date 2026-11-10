@@ -95,7 +95,7 @@ function App() {
     needs_clarification: '需要更多历史线索', invalid_arguments: '历史查询条件无效', failed: '历史读取失败', cancelled: '历史读取已取消'}[state.history_status];
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
-  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceSwitching;
+  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !state.restarting && !state.exit_error && !voiceSwitching;
   const failedReplies = new Set(snapshot.messages.filter(message => message.role === 'assistant' && message.status === 'failed')
     .map(message => message.id));
   const voiceLabel = {off: '语音未启动', standby: '待唤醒', starting: '正在准备', active: '语音交互中', stopping: '正在结束', error: '语音不可用'}[state.voice_status];
@@ -145,6 +145,8 @@ function App() {
       <header className="chat-header">
         <div><span className="eyebrow">VOICE SUPER AGENT</span><h1>小博</h1></div>
         <div className="actions">
+          <button onClick={() => void command('restart_conversation')}
+            disabled={state.restarting || state.exiting || !!state.storage_error || !!state.exit_error}>重新开始</button>
           <button onClick={() => void command('hide_main')}>隐藏到托盘</button>
           <button onClick={() => void command('quit')}>退出应用</button>
         </div>
@@ -153,6 +155,7 @@ function App() {
         <div className="chat-status" role="status" aria-live="polite">
           <span className={`status-dot ${canSend ? 'ready' : ''}`} />
           {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
+            state.restarting ? '正在重新开始…' :
             voiceSwitching ? '语音正在切换…' : state.history_status === 'reading' ? '正在读取历史 · 可发送新消息接管' :
             state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
         </div>
@@ -164,7 +167,7 @@ function App() {
           {state.voice_status === 'starting' || state.voice_status === 'active' ?
             <button onClick={() => void command('end_voice')} disabled={state.exiting}>结束语音</button> :
             <button onClick={() => void command(state.voice_status === 'error' ? 'recover_voice' : 'wake_voice')}
-              disabled={voiceBusy || !!state.storage_error || state.exiting || !state.model_available}>
+              disabled={voiceBusy || !!state.storage_error || state.exiting || state.restarting || !!state.exit_error || !state.model_available}>
               {state.voice_status === 'error' ? '恢复语音' : '唤醒语音'}</button>}
         </div>
         {state.voice_error && <p role="alert" className="model-error">{state.voice_error}</p>}
@@ -173,6 +176,7 @@ function App() {
           <p role="status" className="recovery-status">语音已恢复，等待再次唤醒。</p>}
         {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
         {state.storage_error && <p role="alert" className="model-error">{state.storage_error}</p>}
+        {state.exit_error && <p role="alert" className="model-error">{state.exit_error}</p>}
         <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
           onScroll={event => {
             const element = event.currentTarget;

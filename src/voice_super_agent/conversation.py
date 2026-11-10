@@ -34,12 +34,18 @@ from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.turns.user_stop import UserTurnStoppedParams
 from pipecat.workers.runner import WorkerRunner
+from voice_super_agent.memory.context import WorkingContext
 
 
 class TextDeepSeekService(DeepSeekLLMService):
     """模型请求失败直接反馈，由用户决定后续输入。"""
 
     voice_input = None
+
+    def __init__(self, *, working_context=None, **kwargs):
+        super().__init__(**kwargs)
+        self._working_context = working_context or WorkingContext()
+        self._request_source = []
 
     async def process_frame(self, frame, direction):
         if isinstance(frame, LLMContextFrame) and frame.metadata.get("input_source") == "voice":
@@ -60,9 +66,10 @@ class TextDeepSeekService(DeepSeekLLMService):
         params["messages"] = [dict(instruction, content=instruction["content"] +
                                    f"当前本地时间：{datetime.now().astimezone().isoformat()}。历史时间为 UTC。"),
                               *params["messages"][1:]]
-        return params
+        return self._working_context.project(params, self._request_source)
 
     async def get_chat_completions(self, context):
+        self._request_source = context.get_messages()
         stream = await super().get_chat_completions(context)
 
         async def chunks():
@@ -104,7 +111,8 @@ class Conversation:
     """原生聚合器独占模型上下文，展示事件绑定当前回复。"""
 
     def __init__(self, api_key: str, model: str, base_url: str, emit: Callable[[dict], None],
-                 messages: list[dict] | None = None, voice: bool = False, history: Callable | None = None):
+                 messages: list[dict] | None = None, voice: bool = False, history: Callable | None = None,
+                 context_reference: Callable[[int], dict] | None = None):
         self.context = LLMContext(messages=messages)
         self._emit = emit
         self._reply_id: str | None = None
@@ -159,7 +167,9 @@ class Conversation:
             properties={}, required=[], handler=self._end_voice,
         )]) if voice else self._text_tools
         self.context.set_tools(self._voice_tools if voice else self._text_tools)
+        self._working_context = WorkingContext(context_reference)
         self._llm = TextDeepSeekService(
+            working_context=self._working_context,
             api_key=api_key,
             base_url=base_url,
             settings=DeepSeekLLMService.Settings(
@@ -214,6 +224,7 @@ class Conversation:
                 if self.voice_enabled:
                     self._busy("model", True)
             elif isinstance(frame, FunctionCallsStartedFrame):
+                self._working_context.record_tool_group([call.tool_call_id for call in frame.function_calls])
                 self._response_has_tools = True
                 if self.voice_enabled:
                     self._busy("tool", True)
@@ -581,9 +592,27 @@ class Conversation:
         self._interrupted = True
         await self._stop_asr_resume()
         if self._runner_task is not None:
-            await self._runner.cancel()
-            await self._runner_task
-            if self._reply_id is not None:
-                # 输入可能已进入原生上下文、但助手尚未开始；退出后再采集最终提交。
-                self._emit({"type": "context", "reply_id": self._reply_id,
-                            "messages": deepcopy(self.context.get_messages())})
+            try:
+                if not self._runner_task.done():
+                    if self.voice_enabled:
+                        self._voice.gate.mode = "paused"
+                        self._voice.boundary.advance()
+                    # 先提交原生取消；若 worker 已因故障结束，直接采集其最终上下文。
+                    await self._user.broadcast_interruption()
+                    flushing = asyncio.create_task(self._worker.flush_pipeline())
+                    try:
+                        done, _ = await asyncio.wait((flushing, self._runner_task), return_when=asyncio.FIRST_COMPLETED)
+                        if self._runner_task in done:
+                            await self._runner_task
+                        elif not await flushing:
+                            raise RuntimeError("结束对话时旧回复提交超时，请再次退出重试。")
+                    finally:
+                        flushing.cancel()
+                        await asyncio.gather(flushing, return_exceptions=True)
+            finally:
+                await self._runner.cancel()
+                await self._runner_task
+                if self._reply_id is not None:
+                    # 输入可能已进入上下文、但助手尚未开始；关闭后仍采集实际提交。
+                    self._emit({"type": "context", "reply_id": self._reply_id,
+                                "messages": deepcopy(self.context.get_messages())})

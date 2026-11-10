@@ -92,6 +92,8 @@ class Runtime:
             "history_status": "idle",
             "history_reply_id": None,
             "history_error": "",
+            "restarting": False,
+            "exit_error": "",
         }
 
     def start(self) -> None:
@@ -170,6 +172,10 @@ class Runtime:
             raise ValueError(self._state["storage_error"])
         if self._state["exiting"]:
             raise ValueError("正在保存并退出，请等待。")
+        if self._state["restarting"]:
+            raise ValueError("正在重新开始，请稍后发送。")
+        if self._state["exit_error"]:
+            raise ValueError(self._state["exit_error"])
         if not self._state["model_available"]:
             raise ValueError(self._state["model_error"])
         if self._state["voice_status"] in {"starting", "stopping"}:
@@ -237,8 +243,16 @@ class Runtime:
             messages=deepcopy([record["message"] for record in self._model_records[self._window["model_start_position"]:]]),
             voice=voice,
             history=self._history_call,
+            context_reference=self._context_reference,
         )
         return conversation
+
+    def _context_reference(self, index: int) -> dict:
+        record = self._model_records[self._window["model_start_position"] + index]
+        message = self._messages[record["display_message_id"]]
+        return {"message_id": message["id"], "reply_id": message["reply_id"], "role": message["role"],
+                "source": message["source"], "status": message["status"], "created_at": message["created_at"],
+                "preview": message["text"][:120]}
 
     async def _history_call(self, name: str, arguments: dict, reply_id: str) -> dict:
         # 查询前提交近期记录；原生工具取消时，正在执行的保存事务继续完成。
@@ -612,27 +626,38 @@ class Runtime:
         """先完成原生取消与最终事务，成功后桌面才关闭窗口。"""
         if self._exit_prepared:
             return True
-        self._update({"exiting": True})
+        self._update({"exiting": True, "exit_error": ""})
         self._lifecycle.deactivate()
+        if self._input_task is not None:
+            self._input_task.cancel()
         for task in (self._hotkey_task, self._idle_task, self._device_task):
             if task is not None:
                 task.cancel()
+        try:
+            if self._voice_task is not None:
+                voice_task, self._voice_task = self._voice_task, None
+                voice_task.cancel()
                 with suppress(asyncio.CancelledError):
-                    await task
-        await self._stop_activity()
-        if self._voice_task is not None:
-            self._voice_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._voice_task
-        await self._close_conversation()
-        self._update({"active_reply_id": None})
-        if self._storage_ready:
-            self._request_save(immediate=True)
-            if not await self._flush():
-                self._update({"exiting": False})
-                return False
-        self._exit_prepared = True
-        return True
+                    await voice_task
+            async with self._execution_lock:
+                for task in (self._hotkey_task, self._idle_task, self._device_task):
+                    if task is not None:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+                await self._stop_activity()
+                await self._close_conversation()
+                self._update({"active_reply_id": None})
+                if self._storage_ready:
+                    self._request_save(immediate=True)
+                    if not await self._flush():
+                        self._update({"exiting": False})
+                        return False
+                self._exit_prepared = True
+                return True
+        except (RuntimeError, TimeoutError) as exc:
+            self._update({"exiting": False, "exit_error": f"退出前提交对话失败：{exc}"})
+            return False
 
     def command(self, command: str) -> None:
         asyncio.run_coroutine_threadsafe(self._command(command), self._loop).result()
@@ -640,6 +665,8 @@ class Runtime:
     async def _command(self, command: str) -> None:
         if command in DESKTOP_COMMANDS:
             self.events.put({"kind": "command", "command": command})
+        elif command == "restart_conversation":
+            await self._restart_conversation()
         elif command == "start_activity":
             if self._activity is None:
                 self._update({"activity_running": True})
@@ -647,6 +674,8 @@ class Runtime:
         elif command == "stop_activity":
             await self._stop_activity()
         elif command in {"start_voice", "stop_voice", "wake_voice", "end_voice", "recover_voice"}:
+            if self._state["restarting"] or self._state["exit_error"]:
+                return
             enabled = command in {"start_voice", "wake_voice"}
             recovering = command == "recover_voice"
             if ((enabled or recovering) and self._state["storage_error"]) or self._state["exiting"]:
@@ -675,6 +704,58 @@ class Runtime:
             self._voice_task = asyncio.create_task(self._set_voice(enabled, recovering=recovering), name="switch-voice")
         else:
             raise ValueError(f"未知桌面命令：{command}")
+
+    async def _restart_conversation(self) -> None:
+        if self._state["storage_error"] or self._state["exit_error"] or self._state["exiting"]:
+            raise ValueError(self._state["storage_error"] or self._state["exit_error"] or "正在保存并退出，请等待。")
+        if self._state["restarting"]:
+            return
+        prepare_voice = self._state["voice_status"] in {"starting", "active", "stopping", "standby"}
+        self._update({"restarting": True})
+        if self._input_task is not None:
+            self._input_task.cancel()
+        try:
+            if self._voice_task is not None and not self._voice_task.done():
+                self._voice_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._voice_task
+            async with self._execution_lock:
+                await self._close_conversation(interrupted=True)
+                self._lifecycle.deactivate()
+                if prepare_voice:
+                    self._update({"voice_status": "off", "voice_activity": "listening"})
+                if not await self._flush():
+                    raise ValueError(self._state["storage_error"])
+                window = {"display_start_position": len(self._messages), "model_start_position": len(self._model_records)}
+                # 窗口事务成功后再清空展示，写入失败时继续展示旧工作范围。
+                try:
+                    await self._store.save([dict(message) for message in self._messages.values()],
+                                           deepcopy(self._model_records), window)
+                except (sqlite3.Error, OSError) as exc:
+                    self._update({"storage_status": "error", "storage_error": f"重新开始保存失败：{exc}。请处理原因后再次退出保存。"})
+                    raise ValueError(self._state["storage_error"]) from exc
+                self._window = window
+                self._update({"history_status": "idle", "history_reply_id": None, "history_error": "", "last_error": None,
+                              "voice_recovery": "idle"})
+                if prepare_voice and not self._state["exiting"]:
+                    try:
+                        if self._wake_model_dir is not None:
+                            await self._prepare_voice_conversation()
+                            if self._hotkey_task is None or self._hotkey_task.done():
+                                hotkey = HoldHotkey(self._wake_settings.hotkey)
+                                self._hotkey_task = asyncio.create_task(self._watch_hotkey(hotkey), name="wake-hotkey")
+                        else:
+                            self._conversation = self._create_conversation(voice=True)
+                            await self._conversation.start()
+                            self._conversation._voice.gate.mode = "standby"
+                        self._update({"voice_status": "standby", "voice_activity": "listening", "voice_error": ""})
+                    except (RuntimeError, TimeoutError, ValueError, OSError, WebSocketException) as exc:
+                        if self._conversation is not None:
+                            await self._conversation.close()
+                            self._conversation = None
+                        self._update({"voice_status": "error", "voice_error": f"重新开始后准备语音失败：{exc}"})
+        finally:
+            self._update({"restarting": False})
 
     async def _run_activity(self) -> None:
         """联调活动以真实异步任务持续产生状态，验证 UI 推送和控制并行。"""
