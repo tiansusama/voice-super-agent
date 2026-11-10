@@ -80,6 +80,8 @@ class VoiceHarness:
         self.tts_requests = []
         self.fail_model_after_text = False
         self.hold_model_after_text = False
+        self.tools = {}
+        self.tool_chunk_mode = "separate"
 
     async def recognize(self, request):
         self.asr = web.WebSocketResponse()
@@ -127,14 +129,25 @@ class VoiceHarness:
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         try:
             await response.prepare(request)
-            if payload["messages"][-1]["content"] == "结束语音。":
-                chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
-                         "model": "test-model", "choices": [{"index": 0, "delta": {"tool_calls": [
-                             {"index": 0, "id": "end-test", "type": "function",
-                              "function": {"name": "end_voice", "arguments": "{}"}},
-                         ]}, "finish_reason": "tool_calls"}]}
-                await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
-            for text in (() if payload["messages"][-1]["content"] == "结束语音。" or (self.ending and self.silent_ending)
+            prompt = payload["messages"][-1]["content"]
+            tool = ("end_voice", {}) if prompt == "结束语音。" else self.tools.get(prompt)
+            if tool:
+                calls = tool if isinstance(tool, list) else [tool]
+                deltas = [{"index": index, "id": f"tool-{len(self.requests)}-{index}", "type": "function",
+                           "function": {"name": name, "arguments": json.dumps(arguments)}}
+                          for index, (name, arguments) in enumerate(calls)]
+                chunks = [[delta] for delta in deltas] if self.tool_chunk_mode == "separate" else [deltas]
+                if self.tool_chunk_mode == "interleaved":
+                    remaining = [{"index": delta["index"], "function": {"arguments": delta["function"]["arguments"][5:]}}
+                                 for delta in deltas]
+                    for delta in deltas:
+                        delta["function"]["arguments"] = delta["function"]["arguments"][:5]
+                    chunks.append(remaining)
+                for delta in chunks:
+                    chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
+                             "model": "test-model", "choices": [{"index": 0, "delta": {"tool_calls": delta}, "finish_reason": "tool_calls"}]}
+                    await response.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            for text in (() if tool or (self.ending and self.silent_ending)
                          else ("测试", "回复。")):
                 chunk = {"id": "voice-test", "object": "chat.completion.chunk", "created": 0,
                          "model": "test-model", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]}
@@ -527,7 +540,7 @@ async def test_standby_text_stays_text_and_next_voice_reply_still_plays(voice):
     await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
     assert not voice.output.audio
     assert voice.asr_connections == 0
-    assert "tools" not in voice.requests[-1] or not voice.requests[-1]["tools"]
+    assert {tool["function"]["name"] for tool in voice.requests[-1]["tools"]} == {"history_search", "history_read"}
     await voice.wake()
     await voice.transcript("换成语音继续。")
     await voice.wait(lambda s: s["state"]["voice_activity"] == "speaking")

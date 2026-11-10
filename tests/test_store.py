@@ -36,7 +36,7 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         saved = await self.store.open()
         self.assertEqual(saved, {"messages": self.messages, "model_records": self.records, "window": self.window})
         with closing(sqlite3.connect(self.path)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
 
     async def test_failed_native_reference_rolls_back_display_update(self):
         await self.store.save(self.messages, self.records, self.window)

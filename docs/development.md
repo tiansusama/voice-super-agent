@@ -139,6 +139,8 @@ uv run --locked voice-super-agent --desktop-check
 
 首次打开数据库时应用自动执行已确认版本的初始化脚本 `src/voice_super_agent/memory/migrations/V1.0.0_001__init_conversation.sql`，无需手工执行 SQL。数据库工作由单独的串行 I/O 线程处理，流式片段按短批次合并；用户提交、原生上下文提交和正常退出会触发及时保存。结构、保存时机与恢复规则见 [架构说明](design/V1.0.0-architecture.md#71-sqlite-保存)。
 
+历史回读新增已确认的 `V1.0.0_002__index_history_reply.sql`，启动时自动升级旧库到 `user_version=2` 并增加同轮查询索引。对话中可直接说或输入“查一下上周杭州旅行的预算原文”；模型通过 `history_search` 定位，再用 `history_read` 读取正文、同轮关联或续读片段。未找到时可补充时间、换关键词；读取中可发送新消息接管。主窗口与当前语音卡片显示真实读取结果。接口、查询测量和验证结果见[历史回读记录](verification/stage-10.md)。
+
 ## 7 检查命令与问题定位
 
 ```powershell

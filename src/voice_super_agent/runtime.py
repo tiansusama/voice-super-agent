@@ -89,6 +89,9 @@ class Runtime:
             "playback_stop_ms": 0.0,
             "last_error": None,
             "voice_recovery": "idle",
+            "history_status": "idle",
+            "history_reply_id": None,
+            "history_error": "",
         }
 
     def start(self) -> None:
@@ -233,8 +236,17 @@ class Runtime:
             self._api_key, self._state["model"], self._base_url, emit,
             messages=deepcopy([record["message"] for record in self._model_records[self._window["model_start_position"]:]]),
             voice=voice,
+            history=self._history_call,
         )
         return conversation
+
+    async def _history_call(self, name: str, arguments: dict, reply_id: str) -> dict:
+        # 查询前提交近期记录；原生工具取消时，正在执行的保存事务继续完成。
+        if not await asyncio.shield(self._flush()):
+            raise sqlite3.OperationalError(self._state["storage_error"])
+        if name == "history_search":
+            return await self._store.history_search(**arguments, exclude_reply_id=reply_id)
+        return await self._store.history_read(**arguments)
 
     async def _close_conversation(self, *, interrupted: bool = False) -> None:
         if self._input_task is not None:
@@ -412,6 +424,10 @@ class Runtime:
                                   "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
 
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "history":
+            self._update({"history_status": "reading" if event["active"] else event["status"],
+                          "history_reply_id": event["reply_id"], "history_error": event["error"]})
+            return
         if event["type"] == "voice_input_reset":
             for activity in ("input", "capture", "recognition", "user_turn", "input_tail"):
                 self._lifecycle.activity(activity, False, self._loop.time())

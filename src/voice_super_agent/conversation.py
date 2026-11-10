@@ -3,6 +3,7 @@ from contextlib import suppress
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
+import sqlite3
 from uuid import uuid4
 
 from httpx2 import InvalidURL
@@ -52,6 +53,48 @@ class TextDeepSeekService(DeepSeekLLMService):
         except InvalidURL as exc:
             raise ValueError(f"DEEPSEEK_BASE_URL 配置无效：{exc}") from exc
 
+    def build_chat_completion_params(self, params_from_context):
+        params = super().build_chat_completion_params(params_from_context)
+        # 每次请求提供当前时间，常驻进程跨日期后仍能解释历史时间线索。
+        instruction = params["messages"][0]
+        params["messages"] = [dict(instruction, content=instruction["content"] +
+                                   f"当前本地时间：{datetime.now().astimezone().isoformat()}。历史时间为 UTC。"),
+                              *params["messages"][1:]]
+        return params
+
+    async def get_chat_completions(self, context):
+        stream = await super().get_chat_completions(context)
+
+        async def chunks():
+            calls = {}
+            template = None
+            try:
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.tool_calls:
+                        template = chunk
+                        # 当前 Pipecat 按顺序读取每块的一个调用；先按 index 聚合服务端交错的工具片段。
+                        for part in chunk.choices[0].delta.tool_calls:
+                            if part.index not in calls:
+                                calls[part.index] = part.model_copy(deep=True)
+                            else:
+                                call = calls[part.index]
+                                if part.id:
+                                    call.id = part.id
+                                if part.function:
+                                    call.function.name = (call.function.name or "") + (part.function.name or "")
+                                    call.function.arguments = (call.function.arguments or "") + (part.function.arguments or "")
+                        chunk = chunk.model_copy(deep=True)
+                        chunk.choices[0].delta.tool_calls = None
+                    yield chunk
+                for index in sorted(calls):
+                    choice = template.choices[0]
+                    delta = choice.delta.model_copy(update={"content": None, "tool_calls": [calls[index]]})
+                    yield template.model_copy(update={"usage": None, "choices": [choice.model_copy(update={"delta": delta})]})
+            finally:
+                await stream.close()
+
+        return chunks()
+
     async def cleanup(self):
         await super().cleanup()
         await self._client.close()
@@ -61,7 +104,7 @@ class Conversation:
     """原生聚合器独占模型上下文，展示事件绑定当前回复。"""
 
     def __init__(self, api_key: str, model: str, base_url: str, emit: Callable[[dict], None],
-                 messages: list[dict] | None = None, voice: bool = False):
+                 messages: list[dict] | None = None, voice: bool = False, history: Callable | None = None):
         self.context = LLMContext(messages=messages)
         self._emit = emit
         self._reply_id: str | None = None
@@ -85,16 +128,44 @@ class Conversation:
         self._generation_source = "text"
         self._asr_resume_task: asyncio.Task | None = None
         self._response_has_tools = False
-        self._voice_tools = ToolsSchema([FunctionSchema(
+        self._history = history
+        self._history_calls = {}
+        history_tools = [FunctionSchema(
+            name="history_search",
+            description="只读检索小博自身历史。将主题拆成原文可能出现的关键词，任一词命中即可；可结合大致时间缩小范围。"
+                        "无主题或时间线索时先追问；空结果如实说明，可改写关键词继续查找。返回预览仅用于定位，回答历史细节前用 history_read 读取原文。",
+            properties={
+                "keywords": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 100}, "maxItems": 8},
+                "start_time": {"type": "string", "description": "包含此时刻，带时区的 ISO 8601 时间。"},
+                "end_time": {"type": "string", "description": "不包含此时刻，带时区的 ISO 8601 时间。"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "默认 5 条，按保存顺序从新到旧。"},
+                "before_position": {"type": "integer", "minimum": 0, "description": "续页使用 next_before_position，保留原查询条件。"},
+            }, required=[], handler=self._history_call,
+        ), FunctionSchema(
+            name="history_read",
+            description="按检索返回的消息 ID 读取自身历史原文，保留来源、状态及同轮关联。text 为原文，偏移以 Unicode 字符计数，从 0 开始；"
+                        "next_offset 为 null 表示读完。同轮关联最多 10 条，可用 next_related_offset 续页；前后消息 ID 可继续读取。"
+                        "未完成、被打断及附和记录应按其实际状态理解；读取失败如实说明。",
+            properties={
+                "message_id": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0, "description": "默认 0；续读使用 next_offset。"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 8000, "description": "默认 2000 个字符。"},
+                "related_offset": {"type": "integer", "minimum": 0, "description": "同轮关联列表偏移，默认 0。"},
+            }, required=["message_id"], handler=self._history_call,
+        )] if history is not None else []
+        self._text_tools = ToolsSchema(history_tools)
+        self._voice_tools = ToolsSchema(history_tools + [FunctionSchema(
             name="end_voice", description="用户明确要求结束语音对话时调用。引用、讨论结束字样时继续交流。调用后可简短收尾，也可不回复正文。",
             properties={}, required=[], handler=self._end_voice,
-        )]) if voice else None
+        )]) if voice else self._text_tools
+        self.context.set_tools(self._voice_tools if voice else self._text_tools)
         self._llm = TextDeepSeekService(
             api_key=api_key,
             base_url=base_url,
             settings=DeepSeekLLMService.Settings(
                 model=model,
                 system_instruction=("你是小博，一个友好的中文助手。请结合对话上下文，用清晰自然的中文回答。"
+                                        + ("需要回忆历史时使用 history_search 和 history_read，以读取的原文为依据；线索不足先追问。" if history is not None else "")
                                       + ("回答会直接朗读，请使用适合口语的表达，每次一到三句话。用户明确表示结束本次语音时调用 end_voice，可自行决定简短收尾。" if voice else "")),
             ),
         )
@@ -138,16 +209,27 @@ class Conversation:
             # 语音展示采用模型原文，原生助手聚合器仍在播放路径末端提交实际文本。
             if self.voice_enabled and isinstance(frame, LLMTextFrame):
                 self._emit({"type": "text", "reply_id": self._generation_reply_id, "text": frame.text})
-            if self.voice_enabled:
-                if isinstance(frame, LLMFullResponseStartFrame):
-                    self._response_has_tools = False
+            if isinstance(frame, LLMFullResponseStartFrame):
+                self._response_has_tools = False
+                if self.voice_enabled:
                     self._busy("model", True)
-                elif isinstance(frame, FunctionCallsStartedFrame):
-                    self._response_has_tools = True
+            elif isinstance(frame, FunctionCallsStartedFrame):
+                self._response_has_tools = True
+                if self.voice_enabled:
                     self._busy("tool", True)
-                elif isinstance(frame, LLMFullResponseEndFrame):
-                    frame.metadata["has_function_calls"] = self._response_has_tools
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                frame.metadata["has_function_calls"] = self._response_has_tools
+                if self.voice_enabled:
                     self._busy("model", False)
+
+        @assistant.event_handler("on_before_push_frame")
+        async def on_tool_context(aggregator, frame):
+            if isinstance(frame, LLMContextFrame):
+                # 工具循环沿用所属回复和输入来源，经过相同的原生生成入口。
+                frame.metadata["reply_id"] = self._assistant_reply_id
+                frame.metadata["input_source"] = self._generation_source
+                if self.voice_enabled:
+                    frame.metadata["voice_epoch"] = self._voice.boundary.epoch
 
         @self._llm.event_handler("on_before_process_frame")
         async def on_model_input(service, frame):
@@ -237,8 +319,11 @@ class Conversation:
                 )
                 self._emit({"type": "finished", "reply_id": self._assistant_reply_id, "status": status,
                             "messages": deepcopy(self.context.get_messages())})
-            if self.voice_enabled and isinstance(frame, (FunctionCallResultFrame, FunctionCallCancelFrame)):
-                self._busy("tool", assistant.has_function_calls_in_progress)
+            if isinstance(frame, (FunctionCallResultFrame, FunctionCallCancelFrame)):
+                self._emit({"type": "context", "reply_id": self._assistant_reply_id,
+                            "messages": deepcopy(self.context.get_messages())})
+                if self.voice_enabled:
+                    self._busy("tool", assistant.has_function_calls_in_progress)
 
         services = {self._llm: ("model", "模型请求失败")}
         if voice:
@@ -303,6 +388,26 @@ class Conversation:
             self._busy("playback", isinstance(frame, BotStartedSpeakingFrame))
             if isinstance(frame, BotStoppedSpeakingFrame):
                 self._voice.playback_stopped()
+
+    async def _history_call(self, params):
+        reply_id = self._generation_reply_id
+        self._history_calls[params.tool_call_id] = reply_id
+        self._emit({"type": "history", "reply_id": reply_id, "status": "reading", "active": True, "error": ""})
+        status, error = "cancelled", ""
+        try:
+            try:
+                result = await self._history(params.function_name, params.arguments, reply_id)
+            except (ValueError, TypeError) as exc:
+                result = {"status": "invalid_arguments", "message": str(exc)}
+            except (sqlite3.Error, OSError) as exc:
+                result = {"status": "failed", "message": f"历史读取失败：{exc}"}
+                error = result["message"]
+            status = result["status"]
+            await params.result_callback(result)
+        finally:
+            del self._history_calls[params.tool_call_id]
+            self._emit({"type": "history", "reply_id": reply_id, "status": status,
+                        "active": bool(self._history_calls), "error": error})
 
     async def _end_voice(self, params):
         if (self._voice.gate.mode == "active" and not self._voice.boundary.frozen
@@ -449,8 +554,7 @@ class Conversation:
                 self._voice_pending = None
                 self._voice_finals = self._voice_interim = ""
             self._emit({"type": "voice_input_reset"})
-        if self.voice_enabled:
-            self.context.set_tools([])
+        self.context.set_tools(self._text_tools)
         self._reply_id = reply_id
         self._interrupted = False
         self._failed = False

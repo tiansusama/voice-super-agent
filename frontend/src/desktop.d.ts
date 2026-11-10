@@ -37,6 +37,9 @@ interface DesktopSnapshot {
       source: 'text' | 'voice' | null;
     } | null;
     voice_recovery: 'idle' | 'running' | 'succeeded' | 'failed';
+    history_status: 'idle' | 'reading' | 'found' | 'not_found' | 'needs_clarification' | 'invalid_arguments' | 'failed' | 'cancelled';
+    history_reply_id: string | null;
+    history_error: string;
   };
 }
 

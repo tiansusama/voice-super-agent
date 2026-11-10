@@ -91,6 +91,8 @@ function App() {
 
   if (!snapshot || !view) return <main><p role="status">{error || '正在连接桌面…'}</p></main>;
   const state = snapshot.state;
+  const historyLabel = {idle: '', reading: '正在读取历史…', found: '已读取历史', not_found: '未找到相关历史',
+    needs_clarification: '需要更多历史线索', invalid_arguments: '历史查询条件无效', failed: '历史读取失败', cancelled: '历史读取已取消'}[state.history_status];
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
   const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !voiceSwitching;
@@ -116,6 +118,7 @@ function App() {
             <p className="preview-question">{latestVoiceQuestion?.text || '等待你开始交流'}</p>
             <div className="preview-answer">
               {latestVoiceReply?.text && <p>{latestVoiceReply.text}</p>}
+              {state.history_reply_id === latestVoiceReply?.id && historyLabel && <p role="status">{state.history_error || historyLabel}</p>}
               {capabilityError && <p className="message-error" role="alert">{capabilityError}</p>}
               {!capabilityError && latestVoiceReply?.error && <p className="message-error" role="alert">{latestVoiceReply.error}</p>}
               {state.voice_recovery === 'running' && <p role="status">正在恢复语音…</p>}
@@ -150,7 +153,7 @@ function App() {
         <div className="chat-status" role="status" aria-live="polite">
           <span className={`status-dot ${canSend ? 'ready' : ''}`} />
           {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
-            voiceSwitching ? '语音正在切换…' :
+            voiceSwitching ? '语音正在切换…' : state.history_status === 'reading' ? '正在读取历史 · 可发送新消息接管' :
             state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
         </div>
         <div className="voice-controls">
@@ -185,7 +188,9 @@ function App() {
             <div className="message-author">{message.role === 'user' ? '你' : '小博'}</div>
             {message.text && <div className="message-text">{message.text}</div>}
             {message.status === 'queued' && <span className="message-progress">等待处理…</span>}
-            {message.status === 'thinking' && <span className="message-progress">正在思考…</span>}
+            {state.history_reply_id === message.id && historyLabel && <span className="message-progress" role="status">{state.history_error || historyLabel}</span>}
+            {message.status === 'thinking' && !(state.history_reply_id === message.id && state.history_status === 'reading') &&
+              <span className="message-progress">正在思考…</span>}
             {message.status === 'streaming' && <span className="message-progress">{message.role === 'user' ? '正在识别…' : '正在回复…'}</span>}
             {message.error && <p className="message-error" role="alert">{message.error}</p>}
             {message.role === 'user' && message.source === 'text' && failedReplies.has(message.reply_id) &&
