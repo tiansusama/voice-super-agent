@@ -95,6 +95,8 @@ class VolcengineSTTService(STTService):
                         "enable_itn": True,
                         "enable_punc": True,
                         "enable_nonstream": True,
+                        # 云端提前给出分句定稿，整轮结束继续由原生 Smart Turn 判断。
+                        "end_window_size": 300,
                         "show_utterances": True,
                         "result_type": "full",
                     },
