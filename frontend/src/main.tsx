@@ -1,16 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
+import { MainWindow } from './MainWindow';
 
 function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>();
   const [view, setView] = useState<DesktopConnection['view']>();
   const [error, setError] = useState('');
-  const [draft, setDraft] = useState('');
-  const [sending, setSending] = useState(false);
-  const sendingRef = useRef(false);
-  const messagesRef = useRef<HTMLDivElement>(null);
-  const followLatest = useRef(true);
 
   useEffect(() => {
     let active = true;
@@ -53,33 +49,6 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (followLatest.current && messagesRef.current) {
-      messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
-    }
-  }, [snapshot]);
-
-  async function sendText(originalMessageId?: string) {
-    const text = draft.trim();
-    if ((!originalMessageId && !text) || sendingRef.current) return;
-    sendingRef.current = true;
-    setSending(true);
-    try {
-      if (originalMessageId) await window.pywebview!.api.resend_text(originalMessageId);
-      else {
-        await window.pywebview!.api.send_text(text);
-        setDraft(current => current === draft ? '' : current);
-      }
-      followLatest.current = true;
-      setError('');
-    } catch (reason) {
-      setError(`发送失败：${String(reason)}`);
-    } finally {
-      sendingRef.current = false;
-      setSending(false);
-    }
-  }
-
   async function command(name: string) {
     try {
       await window.pywebview!.api.command(name);
@@ -89,17 +58,11 @@ function App() {
     }
   }
 
-  if (!snapshot || !view) return <main><p role="status">{error || '正在连接桌面…'}</p></main>;
+  if (!snapshot || !view) return <main className="connection-page"><p role="status">{error || '正在连接桌面…'}</p></main>;
   const state = snapshot.state;
   const historyLabel = {idle: '', reading: '正在读取历史…', found: '已读取历史', not_found: '未找到相关历史',
     needs_clarification: '需要更多历史线索', invalid_arguments: '历史查询条件无效', failed: '历史读取失败', cancelled: '历史读取已取消'}[state.history_status];
-  const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
-  const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
-  const canSend = state.model_available && state.storage_status !== 'error' && !state.exiting && !state.restarting && !state.exit_error && !voiceSwitching;
-  const failedReplies = new Set(snapshot.messages.filter(message => message.role === 'assistant' && message.status === 'failed')
-    .map(message => message.id));
   const voiceLabel = {off: '语音未启动', standby: '待唤醒', starting: '正在准备', active: '语音交互中', stopping: '正在结束', error: '语音不可用'}[state.voice_status];
-  const activityLabel = {listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管', thinking: '正在思考', speaking: '正在播报'}[state.voice_activity];
   const latestVoiceQuestion = snapshot.messages.filter(message => message.role === 'user' && message.source === 'voice'
     && message.status !== 'backchannel').at(-1);
   const latestVoiceReply = snapshot.messages.find(message => message.id === latestVoiceQuestion?.reply_id);
@@ -140,100 +103,8 @@ function App() {
     );
   }
 
-  return (
-    <main className="chat-page">
-      <header className="chat-header">
-        <div><span className="eyebrow">VOICE SUPER AGENT</span><h1>小博</h1></div>
-        <div className="actions">
-          <button onClick={() => void command('restart_conversation')}
-            disabled={state.restarting || state.exiting || !!state.storage_error || !!state.exit_error}>重新开始</button>
-          <button onClick={() => void command('hide_main')}>隐藏到托盘</button>
-          <button onClick={() => void command('quit')}>退出应用</button>
-        </div>
-      </header>
-      <section className="chat-panel">
-        <div className="chat-status" role="status" aria-live="polite">
-          <span className={`status-dot ${canSend ? 'ready' : ''}`} />
-          {state.storage_error ? '对话保存异常 · 已暂停新消息' : state.exiting ? '正在保存并退出…' :
-            state.restarting ? '正在重新开始…' :
-            voiceSwitching ? '语音正在切换…' : state.history_status === 'reading' ? '正在读取历史 · 可发送新消息接管' :
-            state.model_available ? (state.active_reply_id ? '正在回复 · 可发送新消息接管' : '文字对话已就绪') : '文字对话暂不可用'}
-        </div>
-        <div className="voice-controls">
-          <div role="status" aria-live="polite">
-            <span>{voiceLabel}{state.voice_status === 'active' && ` · ${activityLabel}`}</span>
-            {state.voice_status === 'standby' && <small>说“{state.wake_word}”或按住 {state.wake_hotkey} 一秒，听到叮声后说话</small>}
-          </div>
-          {state.voice_status === 'starting' || state.voice_status === 'active' ?
-            <button onClick={() => void command('end_voice')} disabled={state.exiting}>结束语音</button> :
-            <button onClick={() => void command(state.voice_status === 'error' ? 'recover_voice' : 'wake_voice')}
-              disabled={voiceBusy || !!state.storage_error || state.exiting || state.restarting || !!state.exit_error || !state.model_available}>
-              {state.voice_status === 'error' ? '恢复语音' : '唤醒语音'}</button>}
-        </div>
-        {state.voice_error && <p role="alert" className="model-error">{state.voice_error}</p>}
-        {state.voice_recovery === 'running' && <p role="status" className="recovery-status">正在恢复语音…</p>}
-        {state.voice_recovery === 'succeeded' && state.voice_status === 'standby' &&
-          <p role="status" className="recovery-status">语音已恢复，等待再次唤醒。</p>}
-        {state.model_error && <p role="alert" className="model-error">{state.model_error}</p>}
-        {state.storage_error && <p role="alert" className="model-error">{state.storage_error}</p>}
-        {state.exit_error && <p role="alert" className="model-error">{state.exit_error}</p>}
-        <div className="messages" ref={messagesRef} aria-label="对话记录" tabIndex={0}
-          onScroll={event => {
-            const element = event.currentTarget;
-            followLatest.current = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
-          }}>
-          {snapshot.messages.length === 0 && <div className="chat-empty">
-            <div className="voice-symbol">{symbol}</div>
-            <h2>你好，我是小博</h2><p>有什么想聊的？</p>
-          </div>}
-          {snapshot.messages.filter(message => !(message.role === 'assistant' && message.status === 'unfinished' && !message.text))
-            .map(message => <article className={`message ${message.role}`} key={message.id}
-            data-message-id={message.id} data-status={message.status}>
-            <div className="message-author">{message.role === 'user' ? '你' : '小博'}</div>
-            {message.text && <div className="message-text">{message.text}</div>}
-            {message.status === 'queued' && <span className="message-progress">等待处理…</span>}
-            {state.history_reply_id === message.id && historyLabel && <span className="message-progress" role="status">{state.history_error || historyLabel}</span>}
-            {message.status === 'thinking' && !(state.history_reply_id === message.id && state.history_status === 'reading') &&
-              <span className="message-progress">正在思考…</span>}
-            {message.status === 'streaming' && <span className="message-progress">{message.role === 'user' ? '正在识别…' : '正在回复…'}</span>}
-            {message.error && <p className="message-error" role="alert">{message.error}</p>}
-            {message.role === 'user' && message.source === 'text' && failedReplies.has(message.reply_id) &&
-              <button className="resend-message" disabled={!canSend || sending}
-                onClick={() => void sendText(message.id)}>重新发送</button>}
-          </article>)}
-        </div>
-        <form className="composer" onSubmit={event => { event.preventDefault(); void sendText(); }}>
-          <label className="sr-only" htmlFor="message-input">输入消息</label>
-          <textarea id="message-input" placeholder="输入消息，Enter 发送，Shift + Enter 换行"
-            value={draft} disabled={!canSend} rows={2}
-            onChange={event => setDraft(event.target.value)}
-            onKeyDown={event => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
-                event.preventDefault();
-                if (canSend) void sendText();
-              }
-            }} />
-          <button type="submit" disabled={!canSend || !draft.trim() || sending}>
-            {sending ? '发送中…' : '发送'}
-          </button>
-        </form>
-        {error && <p role="alert" className="error">{error}</p>}
-      </section>
-      {state.desktop_check && <section className="desktop-check">
-        <h2>桌面联调</h2>
-        <p>语音使用默认音频设备，当前先以耳机环境联调。待唤醒时检测本地唤醒词，唤醒后连接 ASR；听到叮声后再说指令。</p>
-        <p>真实后台任务每秒推送 20 次状态，可在窗口隐藏或重载后继续查看。</p>
-        <div className="check-status">后台计数 <output>{state.activity_tick}</output> · 状态序号 {snapshot.sequence}</div>
-        <div className="actions">
-          <button onClick={() => void command(state.activity_running ? 'stop_activity' : 'start_activity')}>
-            {state.activity_running ? '停止后台活动' : '开始后台活动'}
-          </button>
-          <button onClick={() => void command('preview_floating')}>预览悬浮宿主</button>
-        </div>
-      </section>}
-      <footer>关闭窗口后继续在托盘中运行 · {state.storage_status === 'saved' ? '对话已保存在本机' : state.storage_status === 'saving' ? '正在保存对话…' : '对话保存异常'}</footer>
-    </main>
-  );
+  return <MainWindow snapshot={snapshot} connectionError={error} />;
+
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
