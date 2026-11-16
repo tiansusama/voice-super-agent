@@ -6,6 +6,13 @@ interface DesktopSnapshot {
     main_window: 'visible' | 'hidden' | 'minimized';
     floating_visible: boolean;
     preview_expanded: boolean;
+    floating_hidden: boolean;
+    floating_available: boolean;
+    floating_reply_id: string | null;
+    floating_card_height: number;
+    floating_controls_visible: boolean;
+    floating_hint_visible: boolean;
+    voice_playing: boolean;
     desktop_check: boolean;
     activity_running: boolean;
     activity_tick: number;
@@ -67,6 +74,7 @@ interface Window {
       command(name: string): Promise<void>;
       send_text(text: string): Promise<{ user_message_id: string; reply_id: string }>;
       resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string }>;
+      floating_layout(card_height: number, controls_visible: boolean, hint_visible: boolean): Promise<void>;
     };
   };
 }

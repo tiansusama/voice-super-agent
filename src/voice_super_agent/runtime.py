@@ -21,7 +21,7 @@ from voice_super_agent.audio.devices import read_devices
 
 
 logger = logging.getLogger(__name__)
-DESKTOP_COMMANDS = {"show_main", "hide_main", "quit", "preview_floating", "hide_floating", "toggle_preview_card"}
+DESKTOP_COMMANDS = {"show_main", "hide_main", "quit"}
 
 
 class Runtime:
@@ -60,11 +60,20 @@ class Runtime:
         self._save_urgent = asyncio.Event()
         self._save_task: asyncio.Task | None = None
         self._exit_prepared = False
+        self._floating_session = False
+        self._floating_preview = False
         self._state = {
             "status": "ready",
             "main_window": "visible",
             "floating_visible": False,
             "preview_expanded": True,
+            "floating_hidden": False,
+            "floating_available": False,
+            "floating_reply_id": None,
+            "floating_card_height": 0,
+            "floating_controls_visible": False,
+            "floating_hint_visible": False,
+            "voice_playing": False,
             "desktop_check": desktop_check,
             "activity_running": False,
             "activity_tick": 0,
@@ -143,6 +152,20 @@ class Runtime:
 
     def _update(self, changes: dict[str, Any]) -> None:
         self._state.update(changes)
+        state = self._state
+        current_error = state["last_error"] and state["last_error"]["reply_id"] == state["floating_reply_id"]
+        if state["voice_error"] or state["model_error"] or state["storage_error"] or state["exit_error"] or current_error:
+            state["preview_expanded"] = True
+        if state["voice_status"] in {"off", "standby"}:
+            self._floating_session = False
+        available = (self._floating_session and state["voice_status"] in {"starting", "active", "stopping", "error"}
+                     or self._floating_preview)
+        state["floating_available"] = bool(available and state["main_window"] != "visible"
+                                            and not state["exiting"] and not state["restarting"])
+        # 错误仅保留已经显示的悬浮窗；手动隐藏在本次激活期间持续生效。
+        show = state["voice_status"] != "error" or state["floating_visible"]
+        state["floating_visible"] = state["floating_available"] and show and not state["floating_hidden"]
+        state["voice_playing"] = "playback" in self._lifecycle.busy
         self._sequence += 1
         self.events.put({"kind": "state", "views": tuple(self._views), "snapshot": self._snapshot()})
 
@@ -467,6 +490,8 @@ class Runtime:
             return
         if event["type"] == "voice_busy":
             self._lifecycle.activity(event["activity"], event["active"], self._loop.time())
+            if event["activity"] == "playback":
+                self._update({})
             return
         if event["type"] == "end_requested":
             self._lifecycle.ending_reply = event["reply_id"]
@@ -494,6 +519,8 @@ class Runtime:
                 changes["voice_error"] = event["error"]
             if self._state["active_reply_id"] == reply_id:
                 changes["active_reply_id"] = None
+                if self._state["voice_activity"] == "thinking":
+                    changes["voice_activity"] = "listening"
             self._request_save(immediate=True)
             self._update(changes)
             return
@@ -508,6 +535,7 @@ class Runtime:
                 "created_at": event["created_at"], "error": "",
             }
             if not backchannel:
+                self._state.update(floating_reply_id=reply_id, preview_expanded=True)
                 if event["type"] == "voice_input":
                     self._lifecycle.new_input()
                     self._lifecycle.activity("input", True, self._loop.time())
@@ -665,6 +693,17 @@ class Runtime:
     async def _command(self, command: str) -> None:
         if command in DESKTOP_COMMANDS:
             self.events.put({"kind": "command", "command": command})
+        elif command == "hide_floating":
+            self._floating_preview = False
+            self._update({"floating_hidden": True})
+        elif command == "preview_floating":
+            if not self._state["floating_available"] and not self._state["desktop_check"]:
+                return
+            self._floating_preview = self._state["desktop_check"] and not self._floating_session
+            self.events.put({"kind": "command", "command": "preview_floating"})
+            self._update({"floating_hidden": False, "floating_visible": True})
+        elif command == "toggle_preview_card":
+            self._update({"preview_expanded": not self._state["preview_expanded"]})
         elif command == "restart_conversation":
             await self._restart_conversation()
         elif command == "start_activity":
@@ -699,6 +738,11 @@ class Runtime:
                     self._update({"voice_status": "error", "voice_error": str(exc),
                                   "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
                     return
+            if enabled:
+                self._floating_session = True
+                self._floating_preview = False
+                self._state.update(floating_hidden=False, floating_reply_id=None, floating_card_height=0,
+                                   floating_controls_visible=False, preview_expanded=True)
             self._update({"voice_status": "starting" if enabled or recovering else "stopping", "voice_error": "",
                           "voice_recovery": "running" if recovering else self._state["voice_recovery"]})
             self._voice_task = asyncio.create_task(self._set_voice(enabled, recovering=recovering), name="switch-voice")
@@ -735,7 +779,9 @@ class Runtime:
                     self._update({"storage_status": "error", "storage_error": f"重新开始保存失败：{exc}。请处理原因后再次退出保存。"})
                     raise ValueError(self._state["storage_error"]) from exc
                 self._window = window
+                self._floating_preview = False
                 self._update({"history_status": "idle", "history_reply_id": None, "history_error": "", "last_error": None,
+                              "floating_reply_id": None, "floating_card_height": 0,
                               "voice_recovery": "idle"})
                 if prepare_voice and not self._state["exiting"]:
                     try:

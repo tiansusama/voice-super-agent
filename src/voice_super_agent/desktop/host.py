@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import json
 import logging
+from math import ceil
 from queue import Empty
 from threading import Thread
 
@@ -19,6 +20,9 @@ user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
 user32.SetWindowLongW.restype = wintypes.LONG
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.GetDpiForWindow.restype = wintypes.UINT
+dwmapi = ctypes.WinDLL("dwmapi")
+dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+dwmapi.DwmSetWindowAttribute.restype = wintypes.LONG
 
 
 class DesktopApi:
@@ -40,6 +44,10 @@ class DesktopApi:
     def resend_text(self, user_message_id: str):
         return self._runtime.resend_text(user_message_id)
 
+    def floating_layout(self, card_height: float, controls_visible: bool, hint_visible: bool) -> None:
+        self._runtime.update_windows(floating_card_height=ceil(card_height),
+                                     floating_controls_visible=controls_visible, floating_hint_visible=hint_visible)
+
 
 class Desktop:
     """管理窗口与托盘；独立发送线程承接阻塞的 WebView 脚本调用。"""
@@ -47,7 +55,8 @@ class Desktop:
     def __init__(self, runtime: Runtime, page: str):
         self.runtime = runtime
         self._quitting = False
-        self._expanded = True
+        self._floating_layout = (False, True, 0, False, False, False)
+        self._floating_target = self._floating_layout
         self.main = webview.create_window(
             "小博 · Voice Super Agent", url=page,
             js_api=DesktopApi(runtime, "main"), width=960, height=680,
@@ -55,8 +64,8 @@ class Desktop:
         )
         self.floating = webview.create_window(
             "小博 · 收音窗", url=page,
-            js_api=DesktopApi(runtime, "floating"), width=320, height=312,
-            min_size=(320, 312), resizable=False, frameless=True,
+            js_api=DesktopApi(runtime, "floating"), width=320, height=368,
+            min_size=(320, 368), resizable=False, frameless=True,
             easy_drag=False, hidden=True, focus=False, on_top=True,
             shadow=False, background_color="#FBFAF7",
         )
@@ -105,34 +114,60 @@ class Desktop:
         logger.info("主窗口与托盘已准备")
 
     def _initialize_floating(self, window) -> None:
+        from Microsoft.Win32 import SystemEvents
+
         form = window.native
-        # 用 WS_EX_TOOLWINDOW 替代 WS_EX_APPWINDOW，保留正在初始化 WebView2 的 HWND。
-        handle = form.Handle.ToInt64()
-        style = user32.GetWindowLongW(handle, -20)
-        user32.SetWindowLongW(handle, -20, (style | 0x80) & ~0x40000)
         form.FormClosing += self._floating_closing
         form.DpiChanged += lambda *_: self._shape_floating()
+        SystemEvents.UserPreferenceChanged += lambda *_: self._gui(self._shape_floating)
+        self._sync_floating(self._floating_target)
+
+    def _sync_floating(self, layout: tuple) -> None:
+        self._floating_layout = layout
+        self._show_floating.Enabled = layout[5]
+        if self.floating.native is None:
+            return
         self._shape_floating()
+        if layout[0]:
+            # focus=False 的原生样式持续保留，显示悬浮内容时键盘仍属于当前应用。
+            self.floating.native.Show()
+        else:
+            self.floating.native.Hide()
 
     def _shape_floating(self) -> None:
         from System.Drawing import Point, Region
-        from System.Drawing.Drawing2D import GraphicsPath
+        from System.Drawing.Drawing2D import FillMode, GraphicsPath
         from System.Windows.Forms import Screen
 
         form = self.floating.native
-        scale = user32.GetDpiForWindow(form.Handle.ToInt64()) / 96
-        path = GraphicsPath()
-        if self._expanded:
-            # 物理区域只覆盖圆角卡片与圆球，间隙及外角由系统裁去。
-            radius = 18 * scale
-            width, height = 320 * scale, 224 * scale
+        handle = form.Handle.ToInt64()
+        # 隐藏窗口初始化会重写扩展样式；同步布局时同时恢复免激活的工具窗口样式。
+        style = user32.GetWindowLongW(handle, -20)
+        user32.SetWindowLongW(handle, -20, (style | 0x8000080) & ~0x40000)
+        # Mica 会铺满矩形 HWND；关闭系统背景后，原生区域之外才会透出桌面。
+        backdrop = ctypes.c_int(1)
+        dwmapi.DwmSetWindowAttribute(handle, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+        scale = user32.GetDpiForWindow(handle) / 96
+        path = GraphicsPath(FillMode.Winding)
+        _, expanded, card_height, controls, hint, _ = self._floating_layout
+        rectangles = []
+        if expanded and card_height:
+            rectangles.append((4, 252 - card_height, 312, card_height, 18))
+        if hint:
+            rectangles.append((116, 344, 88, 20, 10))
+        # 原生区域跟随实际卡片高度与悬停按钮；卡片和圆球之间的空隙可穿透。
+        for left, top, width, height, radius in rectangles:
+            left, top, width, height, radius = (value * scale for value in (left, top, width, height, radius))
             diameter = radius * 2
-            for x, y, angle in ((0, 0, 180), (width - diameter, 0, 270),
-                                (width - diameter, height - diameter, 0),
-                                (0, height - diameter, 90)):
+            for x, y, angle in ((left, top, 180), (left + width - diameter, top, 270),
+                                (left + width - diameter, top + height - diameter, 0),
+                                (left, top + height - diameter, 90)):
                 path.AddArc(float(x), float(y), float(diameter), float(diameter), float(angle), 90.0)
             path.CloseFigure()
-        path.AddEllipse(float(248 * scale), float(244 * scale), float(64 * scale), float(64 * scale))
+        path.AddEllipse(float(128 * scale), float(272 * scale), float(64 * scale), float(64 * scale))
+        if controls:
+            for left in (122, 172):
+                path.AddEllipse(float(left * scale), float(256 * scale), float(26 * scale), float(26 * scale))
         previous = form.Region
         form.Region = Region(path)
         path.Dispose()
@@ -158,7 +193,7 @@ class Desktop:
         if not self._quitting:
             args.Cancel = True
             sender.Hide()
-            self.runtime.update_windows(floating_visible=False)
+            self.runtime.command("hide_floating")
 
     def _main_visibility_changed(self, *_args) -> None:
         from System.Windows.Forms import FormWindowState
@@ -171,9 +206,6 @@ class Desktop:
         else:
             state = "visible"
         self.runtime.update_windows(main_window=state)
-        if state == "visible" and self.floating.native is not None:
-            self.floating.native.Hide()
-            self.runtime.update_windows(floating_visible=False)
 
     def _gui(self, action) -> None:
         from System import Action
@@ -203,27 +235,10 @@ class Desktop:
             self._gui(self.main.native.Hide)
         elif command == "preview_floating":
             self._gui(self._show_preview)
-        elif command == "hide_floating":
-            def hide():
-                self.floating.native.Hide()
-                self.runtime.update_windows(floating_visible=False)
-            self._gui(hide)
-        elif command == "toggle_preview_card":
-            def toggle():
-                self._expanded = not self._expanded
-                self._shape_floating()
-                self.runtime.update_windows(preview_expanded=self._expanded)
-            self._gui(toggle)
         return True
 
     def _show_preview(self) -> None:
         self.main.native.Hide()
-        self._shape_floating()
-        # 避开 pywebview.show() 的 Activate 路径，保留 focus=False 的原生样式。
-        self.floating.native.Show()
-        self._show_floating.Enabled = True
-        self.runtime.update_windows(floating_visible=True, preview_expanded=self._expanded)
-        logger.info("显示悬浮宿主，DPI：%s", user32.GetDpiForWindow(self.floating.native.Handle.ToInt64()))
 
     def _close_windows(self) -> None:
         self._tray.Visible = False
@@ -252,6 +267,11 @@ class Desktop:
                     break
                 event = following
             state = event["snapshot"]["state"]
+            layout = (state["floating_visible"], state["preview_expanded"], state["floating_card_height"],
+                      state["floating_controls_visible"], state["floating_hint_visible"], state["floating_available"])
+            if layout != self._floating_target:
+                self._floating_target = layout
+                self._gui(lambda layout=layout: self._sync_floating(layout))
             tray_status = ("小博 · 模型不可用" if not state["model_available"] else
                            "小博 · 正在恢复语音" if state["voice_recovery"] == "running" else
                            "小博 · 语音不可用" if state["voice_status"] == "error" else "小博 · 后台运行")

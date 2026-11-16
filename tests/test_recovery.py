@@ -14,7 +14,8 @@ from voice_super_agent.runtime import Runtime
 @pytest.mark.parametrize("service", ["asr", "system_one", "tts"])
 async def test_voice_service_failure_preserves_text_and_manual_recovery_waits_for_wake(voice, service):
     await voice.wake()
-    voice.runtime.update_windows(main_window="hidden", floating_visible=False)
+    voice.runtime.update_windows(main_window="hidden")
+    voice.runtime.command("hide_floating")
     if service == "tts":
         voice.failures["tts"] = 503
         await voice.transcript("请回答这个问题。")

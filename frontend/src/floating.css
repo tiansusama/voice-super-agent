@@ -1,0 +1,30 @@
+.floating { overflow: hidden; background: #fbfaf7; }
+.floating-widget { position: relative; width: 320px; height: 368px; color: #3c3530; }
+.floating-conversation { position: absolute; left: 4px; right: 4px; bottom: 116px; display: flex; flex-direction: column; max-height: 236px; padding: 14px; border: 1px solid #e9e1d8; border-radius: 18px; background: #fffdfb; box-shadow: 0 4px 14px #74553712; }
+.floating-transcript { min-height: 0; overflow-y: auto; overflow-anchor: none; scrollbar-width: thin; scrollbar-color: #dbcebd transparent; }
+.floating-transcript p { margin: 0; font-size: 13px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.floating-transcript p + p { margin-top: 12px; }
+.floating-transcript .floating-question { width: fit-content; max-width: 94%; margin-left: auto; padding: 7px 11px; border-radius: 13px 4px 13px 13px; color: #665044; background: #faede2; }
+.floating-transcript .floating-answer { color: #3c3530; }
+.floating-transcript .floating-progress { color: #97806a; font-size: 11px; }
+.floating-transcript .floating-failure { color: #a34d33; font-size: 12px; }
+.floating-card-actions { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 10px; padding-top: 9px; }
+.floating-card-actions button { display: inline-flex; align-items: center; gap: 4px; padding: 3px 1px; border: 0; border-radius: 4px; color: #9d653a; background: transparent; font-size: 11px; }
+.orb-interaction { position: absolute; left: 122px; top: 256px; width: 76px; height: 80px; }
+.voice-orb { position: absolute; left: 6px; top: 16px; display: grid; place-items: center; width: 64px; height: 64px; padding: 0; border: 0; border-radius: 50%; background: #fffaf5; box-shadow: inset 0 0 0 6px #f8f3ed; }
+.voice-orb:hover { background: #fff7ed; }
+.voice-orb:focus-visible { outline-offset: -6px; }
+.microphone-ring { position: absolute; inset: 0; width: 64px; height: 64px; fill: none; stroke-width: 3; transform: rotate(-90deg); }
+.ring-track { stroke: #eae3db; }
+.ring-level { stroke: #c49a74; stroke-linecap: round; transition: stroke-dasharray 90ms linear; }
+.orb-wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 30px; }
+.orb-wave i { display: block; width: 4px; border-radius: 4px; background: #bd8b61; transition: height 90ms linear; }
+.floating-widget[data-mode="busy"] .orb-wave i { animation: orb-think 1.8s ease-in-out infinite; }
+.floating-widget[data-mode="error"] .ring-level { stroke: #af6247; }
+.orb-control { position: absolute; top: 0; z-index: 1; display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 1px solid #eaded0; border-radius: 50%; background: #fffaf5; opacity: 0; visibility: hidden; }
+.orb-control[data-visible="true"] { opacity: 1; visibility: visible; }
+.orb-end { left: 0; }
+.orb-hide { right: 0; }
+.orb-hint { position: absolute; top: 344px; left: 116px; width: 88px; height: 20px; border-radius: 10px; color: #90775f; background: #fbfaf7; font-size: 10px; line-height: 20px; text-align: center; }
+@keyframes orb-think { 0%, 100% { transform: scaleY(0.6); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) { .floating-widget[data-mode="busy"] .orb-wave i { animation: none; } .ring-level, .orb-wave i { transition: none; } }
