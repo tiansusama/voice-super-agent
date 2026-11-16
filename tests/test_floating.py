@@ -40,6 +40,31 @@ async def test_floating_visibility_follows_activation_window_and_manual_hide(voi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("voice", [True], indirect=True)
+async def test_floating_collapse_survives_same_turn_transcripts_and_commit(voice):
+    voice.runtime.update_windows(main_window="hidden")
+    await voice.wake()
+    await voice.transcript("这个问题", final=False)
+    first = await voice.wait(lambda s: bool(s["messages"]))
+    reply_id = first["state"]["floating_reply_id"]
+    voice.runtime.command("toggle_preview_card")
+    assert not voice.runtime.connect("test")["state"]["preview_expanded"]
+    await voice.transcript("这个问题还在说", final=False)
+    interim = await voice.wait(lambda s: s["messages"][0]["text"] == "这个问题还在说")
+    assert interim["state"]["floating_reply_id"] == reply_id
+    assert not interim["state"]["preview_expanded"]
+    await voice.transcript("这个问题还在说。")
+    committed = await voice.wait(lambda s: s["messages"][0]["status"] == "completed")
+    assert committed["state"]["floating_reply_id"] == reply_id
+    assert not committed["state"]["preview_expanded"]
+    voice.release_audio()
+    await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and not s["state"]["voice_playing"])
+    await voice.transcript("新一轮问题", final=False)
+    next_turn = await voice.wait(lambda s: s["state"]["floating_reply_id"] != reply_id)
+    assert next_turn["state"]["preview_expanded"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
 async def test_candidate_backchannel_and_confirmed_takeover_keep_correct_floating_round(voice):
     voice.runtime.update_windows(main_window="hidden")
     await voice.wake()

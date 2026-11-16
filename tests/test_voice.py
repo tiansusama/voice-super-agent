@@ -690,11 +690,12 @@ async def test_audio_stream_failure_reports_unavailability_even_if_endpoint_is_s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("voice", [True], indirect=True)
-async def test_text_replaces_uncommitted_voice_and_next_voice_uses_the_shared_context(voice):
+@pytest.mark.parametrize("transcription_final", [False, True])
+async def test_text_replaces_uncommitted_voice_and_next_voice_uses_the_shared_context(voice, transcription_final):
     await voice.wake()
     conversation = voice.runtime._conversation
     await voice.backend(conversation._user.queue_frame(VADUserStartedSpeakingFrame()))
-    await voice.transcript("这个问题还没说完。")
+    await voice.transcript("这个问题还没说完。", final=transcription_final)
     await voice.wait(lambda s: bool(s["messages"]))
     assert not voice.requests
     voice.runtime.send_text("改用文字问这个问题。")
@@ -707,6 +708,12 @@ async def test_text_replaces_uncommitted_voice_and_next_voice_uses_the_shared_co
     users = [m["content"] for m in voice.requests[-1]["messages"] if m["role"] == "user"]
     assert users == ["改用文字问这个问题。"]
     await voice.resume_voice_input()
+    voice.runtime.update_windows(main_window="hidden")
+    listening = voice.runtime.connect("test")["state"]
+    assert listening["floating_visible"]
+    assert listening["voice_activity"] == "listening"
+    assert listening["active_reply_id"] is None
+    assert not listening["voice_playing"]
     await voice.transcript("现在用语音追问。")
     voice.release_audio()
     snapshot = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed" and s["messages"][-1]["source"] == "voice")

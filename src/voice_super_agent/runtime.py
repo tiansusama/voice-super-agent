@@ -468,6 +468,8 @@ class Runtime:
         if event["type"] == "voice_input_reset":
             for activity in ("input", "capture", "recognition", "user_turn", "input_tail"):
                 self._lifecycle.activity(activity, False, self._loop.time())
+            # 文字接管已清空旧语音输入，识别提示随之回到聆听。
+            self._update({"voice_activity": "listening"})
             return
         if event["type"] == "voice_superseded":
             self._messages[event["user_id"]].update(text=event["text"], status="unfinished")
@@ -535,7 +537,8 @@ class Runtime:
                 "created_at": event["created_at"], "error": "",
             }
             if not backchannel:
-                self._state.update(floating_reply_id=reply_id, preview_expanded=True)
+                if self._state["floating_reply_id"] != reply_id:
+                    self._state.update(floating_reply_id=reply_id, preview_expanded=True)
                 if event["type"] == "voice_input":
                     self._lifecycle.new_input()
                     self._lifecycle.activity("input", True, self._loop.time())
