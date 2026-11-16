@@ -1,6 +1,7 @@
 """System One classification integrated with native Pipecat user turns."""
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 
 import aiohttp
@@ -27,6 +28,7 @@ from pipecat.turns.user_start import TranscriptionUserTurnStartStrategy
 from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from voice_super_agent.voice.interruption import SystemOneInterruptionProcessor
+from voice_super_agent.memory.context import WorkingContext
 
 
 def _pipeline(respond):
@@ -246,3 +248,74 @@ async def test_request_error_marks_processor_unusable():
         ],
     )
     assert not gate.is_usable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_classification_bounds_recent_complete_turns_without_mutating_history(with_tools):
+    async def respond(text):
+        return "backchannel"
+
+    gate, context, pipeline, requests = _pipeline(respond)
+    messages = []
+    for index in range(50):
+        messages.extend([{"role": "user", "content": f"旧问题{index}"},
+                         {"role": "assistant", "content": "旧回答🙂。" * 600}])
+    latest = [{"role": "user", "content": "当前问题。"}]
+    if with_tools:
+        latest.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"call-{index}", "type": "function", "function": {"name": "history_read", "arguments": "{}"}}
+            for index in range(2)]})
+        latest.extend({"role": "tool", "tool_call_id": f"call-{index}", "content": "历史原文🙂。" * 300}
+                      for index in range(2))
+    latest.append({"role": "assistant", "content": "当前回答。" * 1000})
+    messages.extend(latest)
+    original = deepcopy(messages)
+    context.set_messages(messages)
+    await run_test(pipeline, frames_to_send=[BotStartedSpeakingFrame(), TranscriptionFrame("嗯嗯，你继续。", "user", "now"),
+                                            SleepFrame(sleep=.05)])
+    assert len(requests) == 1
+    conversation = requests[0]["json"]["state"]["conversation"]
+    assert WorkingContext.size(conversation) <= 65536
+    assert len(conversation) < len(original)
+    assert conversation == original[-len(conversation):]
+    assert conversation[0]["role"] == "user"
+    assert conversation[-len(latest):] == latest
+    calls = [call["id"] for message in conversation for call in message.get("tool_calls", [])]
+    results = [message["tool_call_id"] for message in conversation if message["role"] == "tool"]
+    assert calls == results
+    assert context.get_messages() == original
+    assert gate.is_usable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized", ["user", "assistant", "tools"])
+async def test_oversized_latest_classification_turn_reports_error_without_sending_or_truncating(oversized):
+    async def respond(text):
+        return "backchannel"
+
+    gate, context, pipeline, requests = _pipeline(respond)
+    latest = [{"role": "user", "content": "当前问题。"}]
+    text = "超长原文🙂。" * 5000
+    if oversized == "user":
+        latest[0]["content"] = text
+    elif oversized == "assistant":
+        latest.append({"role": "assistant", "content": text})
+    else:
+        latest.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": "large-call", "type": "function", "function": {"name": "history_read", "arguments": "{}"}}]})
+        latest.append({"role": "tool", "tool_call_id": "large-call", "content": text})
+    original = deepcopy(latest)
+    context.set_messages(latest)
+    errors = []
+
+    @gate.event_handler("on_error")
+    async def error(processor, failure):
+        errors.append(failure.error)
+
+    await run_test(pipeline, frames_to_send=[BotStartedSpeakingFrame(), TranscriptionFrame("等一下。", "user", "now"),
+                                            SleepFrame(sleep=.05)])
+    assert requests == []
+    assert not gate.is_usable
+    assert any("超出工作窗口预算" in error for error in errors)
+    assert context.get_messages() == original

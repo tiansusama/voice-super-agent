@@ -27,6 +27,8 @@ from pipecat.frames.frames import (
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from voice_super_agent.memory.context import WorkingContext
+
 
 class Decision(StrEnum):
     """Intent labels returned by System One."""
@@ -181,6 +183,12 @@ class SystemOneInterruptionProcessor(FrameProcessor):
         started = time.perf_counter()
         result = _ClassificationResultFrame(candidate=candidate, text=text)
         try:
+            conversation = list(self._context.get_messages())
+            if conversation:
+                # 判意只装载预算内完整轮次，原生上下文继续保存完整历史。
+                # 判意指令由 questions 提供，投影的空系统位在发送前移除。
+                params = {"messages": [{"role": "system", "content": ""}, *conversation], "tools": []}
+                conversation = WorkingContext(tool_reserve_bytes=0).project(params, conversation)["messages"][1:]
             async with self._session.post(
                 "https://ark.cn-beijing.volces.com/api/v1/systemone",
                 headers={
@@ -191,7 +199,7 @@ class SystemOneInterruptionProcessor(FrameProcessor):
                     "model": "doubao-seed-2-1-lite-260915",
                     "state": {
                         "assistant_is_speaking": True,
-                        "conversation": list(self._context.get_messages()),
+                        "conversation": conversation,
                         "user_transcript": text,
                     },
                     "questions": {"interruption_intent": QUESTION},
