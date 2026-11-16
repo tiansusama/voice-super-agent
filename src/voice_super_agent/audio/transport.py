@@ -60,7 +60,17 @@ class DesktopAudioTransport(BaseTransport):
         async with self._open_lock:
             if self._pa is None:
                 self._loop = asyncio.get_running_loop()
-                await asyncio.to_thread(self._open_streams)
+                opening = asyncio.create_task(asyncio.to_thread(self._open_streams))
+                cancelled = None
+                # 工作线程完成后再响应取消，让关闭操作始终等待实际打开过程结束。
+                while not opening.done():
+                    try:
+                        await asyncio.shield(opening)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                opening.result()
+                if cancelled is not None:
+                    raise cancelled
                 self._emit({"type": "audio_devices", "microphone": self.devices.microphone.name,
                             "speaker": self.devices.speaker.name, "sample_rate": RATE})
 

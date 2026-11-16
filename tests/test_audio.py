@@ -1,5 +1,6 @@
 import asyncio
 import time
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -150,6 +151,56 @@ async def test_parallel_processor_cleanup_releases_device_resources_once(audio):
     assert len(audio.sessions) == 1
     assert all(stream.closed for stream in audio.sessions[0].streams)
     assert audio.sessions[0].terminated
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+@pytest.mark.parametrize("open_fails", [False, True])
+async def test_cancelled_open_finishes_before_close_releases_all_streams(audio, monkeypatch, repeat_cancel, open_fails):
+    entered, release = Event(), Event()
+    original_open = module.pyaudio.PyAudio.open
+
+    def delayed_open(session, **options):
+        if options.get("output"):
+            entered.set()
+            assert release.wait(5)
+            if open_fails:
+                raise OSError("播放设备打开失败")
+        return original_open(session, **options)
+
+    monkeypatch.setattr(module.pyaudio.PyAudio, "open", delayed_open)
+    opening = asyncio.create_task(audio.transport.open())
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        opening.cancel()
+        await asyncio.sleep(0)
+        if repeat_cancel:
+            opening.cancel()
+            await asyncio.sleep(0)
+        closing = asyncio.create_task(audio.transport.close())
+        await asyncio.sleep(.02)
+        assert not closing.done()
+        assert not audio.sessions[0].terminated
+        assert not audio.sessions[0].streams[0].closed
+        release.set()
+        result, = await asyncio.gather(opening, return_exceptions=True)
+        if open_fails:
+            assert isinstance(result, OSError) and str(result) == "播放设备打开失败"
+        else:
+            assert isinstance(result, asyncio.CancelledError)
+        await closing
+        assert all(stream.closed for stream in audio.sessions[0].streams)
+        assert len(audio.sessions[0].streams) == (1 if open_fails else 2)
+        assert audio.sessions[0].terminated
+        assert audio.transport._pa is None
+        assert audio.transport._in_stream is audio.transport._out_stream is None
+    finally:
+        release.set()
+        await asyncio.gather(opening, return_exceptions=True)
+        if closing is not None:
+            await closing
+        await audio.transport.close()
 
 
 @pytest.mark.asyncio
