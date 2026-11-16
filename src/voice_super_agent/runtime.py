@@ -40,7 +40,7 @@ class Runtime:
         self._wake_model_dir = wake_model_dir
         self._wake_settings = WakeSettings()
         self._settings_values: dict = {}
-        self._configuration_error = ""
+        self._configuration_errors: dict[str, str] = {}
         self._pending_detector: KeywordDetector | None = None
         self._hotkey = HoldHotkey(self._wake_settings.hotkey)
         self._lifecycle = VoiceLifecycle()
@@ -126,12 +126,21 @@ class Runtime:
             self._state.update(storage_status="error", storage_error=f"读取对话失败：{exc}。本次未恢复记录，已暂停新消息。")
             return
         self._storage_ready = True
+        # 各字段独立恢复，有效的环境值在其他字段报错时继续保留。
+        self._wake_settings.word = self._settings_values.get("word", os.getenv("VOICE_WAKE_WORD", "你好小博"))
+        hotkey = self._settings_values.get("hotkey", os.getenv("VOICE_WAKE_HOTKEY", "Ctrl+\\"))
         try:
-            self._wake_settings = WakeSettings.from_environment(self._settings_values)
-            self._hotkey = HoldHotkey(self._wake_settings.hotkey)
+            self._hotkey = HoldHotkey(hotkey)
+            self._wake_settings.hotkey = hotkey
         except ValueError as exc:
-            self._configuration_error = f"交互配置无效：{exc}"
-            self._state.update(settings_error=self._configuration_error, voice_status="error", voice_error=self._configuration_error)
+            self._configuration_errors["hotkey"] = str(exc)
+        try:
+            self._wake_settings.idle_seconds = WakeSettings.from_environment(self._settings_values).idle_seconds
+        except ValueError as exc:
+            self._configuration_errors["idle_seconds"] = str(exc)
+        if self._configuration_errors:
+            error = "交互配置无效：" + "；".join(self._configuration_errors.values())
+            self._state.update(settings_error=error, voice_status="error", voice_error=error)
         self._lifecycle.idle_seconds = self._wake_settings.idle_seconds
         self._state.update(wake_word=self._wake_settings.word, wake_hotkey=self._wake_settings.hotkey,
                            voice_idle_seconds=self._wake_settings.idle_seconds,
@@ -213,7 +222,8 @@ class Runtime:
                     value = value.strip()
                 values = dict(self._settings_values)
                 detector = None
-                if name == "word" and value != self._wake_settings.word:
+                # 当前词可能仅来自环境；现有检测器才能证明它已经通过模型校验。
+                if name == "word" and (value != self._wake_settings.word or self._detector is None):
                     if self._wake_model_dir is None:
                         raise ValueError("当前运行方式未配置本地唤醒模型目录。")
                     detector = await asyncio.to_thread(KeywordDetector, self._wake_model_dir, value)
@@ -223,27 +233,33 @@ class Runtime:
                     values[name] = value
                     if name == "word":
                         values.pop("pending_word", None)
-                configured = WakeSettings.from_environment(values)
-                hotkey = HoldHotkey(configured.hotkey)
+                if name == "hotkey":
+                    hotkey = HoldHotkey(value)
                 # 先完成事务，再更换热键、期限及待应用检测器；失败时旧运行状态继续生效。
                 await self._store.save_settings(values)
                 self._settings_values = values
-                self._configuration_error = ""
+                self._configuration_errors.pop(name, None)
+                error = ("交互配置无效：" + "；".join(self._configuration_errors.values())
+                         if self._configuration_errors else "")
+                changes = {"settings_error": error}
+                if "交互配置无效：" in self._state["voice_error"]:
+                    changes["voice_error"] = error or "交互配置已修正，请恢复语音。"
                 if name == "word":
                     self._pending_detector = detector
-                    self._update({"pending_wake_word": values.get("pending_word")})
-                    if self._state["voice_status"] == "standby" and not await self._apply_pending_word():
-                        raise ValueError(self._state["settings_error"])
+                    changes["pending_wake_word"] = values.get("pending_word")
                 elif name == "hotkey":
-                    self._wake_settings.hotkey = configured.hotkey
+                    self._wake_settings.hotkey = value
                     self._hotkey = hotkey
-                    self._update({"wake_hotkey": configured.hotkey})
+                    changes["wake_hotkey"] = value
                 else:
-                    self._wake_settings.idle_seconds = configured.idle_seconds
-                    self._lifecycle.idle_seconds = configured.idle_seconds
-                    self._lifecycle.deadline = (self._loop.time() + configured.idle_seconds
+                    self._wake_settings.idle_seconds = value
+                    self._lifecycle.idle_seconds = value
+                    self._lifecycle.deadline = (self._loop.time() + value
                                                if self._lifecycle.active and not self._lifecycle.busy else None)
-                    self._update({"voice_idle_seconds": configured.idle_seconds})
+                    changes["voice_idle_seconds"] = value
+                self._update(changes)
+                if name == "word" and self._state["voice_status"] == "standby" and not await self._apply_pending_word():
+                    raise ValueError(self._state["settings_error"])
                 return {"pending": name == "word" and self._state["pending_wake_word"] is not None}
         except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
             message = f"设置未生效：{exc}"
@@ -523,8 +539,8 @@ class Runtime:
         self._conversation._voice.gate.mode = "standby"
 
     def _require_voice_configuration(self):
-        if self._configuration_error:
-            raise ValueError(self._configuration_error)
+        if self._configuration_errors:
+            raise ValueError("交互配置无效：" + "；".join(self._configuration_errors.values()))
         missing = [name for name in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY")
                    if not os.getenv(name, "").strip()]
         if missing:
