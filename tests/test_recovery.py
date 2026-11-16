@@ -112,6 +112,39 @@ async def test_audio_device_cleanup_timeout_preserves_recovery_and_exit(voice, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("voice", [True], indirect=True)
+@pytest.mark.parametrize("command", ["wake_voice", "end_voice"])
+@pytest.mark.parametrize("next_action", ["recover_voice", "text", "exit"])
+async def test_voice_switch_flush_failure_and_cleanup_failure_keep_recovery_available(voice, monkeypatch, command, next_action):
+    if command == "end_voice":
+        await voice.wake()
+    conversation = voice.runtime._conversation
+
+    async def failed_flush():
+        return False
+
+    monkeypatch.setattr(conversation._worker, "flush_pipeline", failed_flush)
+    voice.runtime.command(command)
+    failed = await voice.wait(lambda s: s["state"]["voice_status"] == "error" and voice.runtime._voice_task.done())
+    assert voice.runtime._voice_task.exception() is None
+    assert "原生提交超时" in failed["state"]["voice_error"]
+    assert "语音清理失败" in failed["state"]["voice_error"]
+    assert "结束对话时旧回复提交超时" in failed["state"]["voice_error"]
+    assert failed["state"]["model_available"]
+    assert failed["state"]["active_reply_id"] is None
+    assert conversation._runner_task.done()
+    if next_action == "recover_voice":
+        voice.runtime.command("recover_voice")
+        recovered = await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+        assert recovered["state"]["voice_recovery"] == "succeeded"
+        assert not recovered["state"]["voice_error"]
+    elif next_action == "text":
+        receipt = voice.runtime.send_text("切换语音失败后继续文字交流。")
+        await voice.wait(lambda s: any(row["id"] == receipt["reply_id"] and row["status"] == "completed" for row in s["messages"]))
+    assert await asyncio.to_thread(voice.runtime.prepare_exit)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
 async def test_transient_model_failure_keeps_voice_usable_without_automatic_retry(voice):
     await voice.wake()
     voice.failures["model"] = 503

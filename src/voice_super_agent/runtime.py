@@ -519,10 +519,17 @@ class Runtime:
             except (RuntimeError, TimeoutError, ValueError, OSError, WebSocketException) as exc:
                 logger.exception("切换语音失败")
                 self._lifecycle.deactivate()
+                error = f"语音启动失败：{exc}"
                 if self._conversation is not None:
-                    await self._conversation.close()
-                    self._conversation = None
-                self._update({"voice_status": "error", "voice_error": f"语音启动失败：{exc}",
+                    try:
+                        await self._conversation.close()
+                    except (RuntimeError, TimeoutError, ValueError, OSError, WebSocketException) as cleanup_error:
+                        logger.exception("切换语音后清理失败")
+                        error += f" 语音清理失败：{cleanup_error}"
+                    else:
+                        self._conversation = None
+                # 清理错误一并反馈，用户仍可恢复语音、继续文字或退出。
+                self._update({"voice_status": "error", "voice_error": error, "active_reply_id": None,
                               "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
 
     async def _prepare_voice_conversation(self):
