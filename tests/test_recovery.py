@@ -64,6 +64,54 @@ async def test_voice_service_failure_preserves_text_and_manual_recovery_waits_fo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("voice", [True], indirect=True)
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("action", ["recover", "exit"])
+async def test_audio_device_cleanup_timeout_preserves_recovery_and_exit(voice, monkeypatch, active, action):
+    voice.runtime.send_text("设备失效前保留的内容。")
+    original = await voice.wait(lambda s: s["messages"][-1]["status"] == "completed")
+    if active:
+        await voice.wake()
+    conversation = voice.runtime._conversation
+    device_task = voice.runtime._device_task
+    original_flush = conversation._worker.flush_pipeline
+
+    async def failed_flush():
+        return False
+
+    monkeypatch.setattr(conversation._worker, "flush_pipeline", failed_flush)
+    voice.audio_active = False
+    try:
+        failed = await voice.wait(lambda s: s["state"]["voice_status"] == "error")
+        assert "设备已失效" in failed["state"]["voice_error"]
+        assert "旧回复提交超时" in failed["state"]["voice_error"]
+        assert failed["state"]["model_available"]
+        assert failed["state"]["active_reply_id"] is None
+        assert failed["state"]["microphone_level"] == failed["state"]["playback_level"] == 0
+        assert failed["messages"] == original["messages"]
+        assert conversation._runner_task.done()
+        assert not device_task.done()
+        voice.audio_active = True
+        monkeypatch.setattr(conversation._worker, "flush_pipeline", original_flush)
+        if action == "recover":
+            voice.runtime.command("recover_voice")
+            recovered = await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+            assert recovered["state"]["voice_recovery"] == "succeeded"
+            assert not recovered["state"]["voice_error"]
+            assert voice.runtime._conversation is not conversation
+            assert not device_task.done()
+            voice.runtime.send_text("恢复后继续文字交流。")
+            await voice.wait(lambda s: len(s["messages"]) == 4 and s["messages"][-1]["status"] == "completed")
+        assert await asyncio.to_thread(voice.runtime.prepare_exit)
+        assert await asyncio.to_thread(voice.runtime.prepare_exit)
+    finally:
+        # 失败用例也回收已结束的监控任务，避免夹具退出重复抛出同一个异常。
+        if device_task.done() and not device_task.cancelled():
+            device_task.exception()
+            voice.runtime._device_task = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", [True], indirect=True)
 async def test_transient_model_failure_keeps_voice_usable_without_automatic_retry(voice):
     await voice.wake()
     voice.failures["model"] = 503

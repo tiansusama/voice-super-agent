@@ -455,9 +455,15 @@ class Runtime:
                     self._conversation_event({"type": "error", "reply_id": self._state["active_reply_id"],
                                               "error": str(exc), "service": "audio", "category": "connectivity",
                                               "permanent": True, "voice": True})
-                    await self._close_conversation()
+                    error = str(exc)
+                    try:
+                        await self._close_conversation()
+                    except (RuntimeError, TimeoutError) as cleanup_error:
+                        logger.exception("设备失效后提交对话失败")
+                        error += f" 语音清理失败：{cleanup_error}"
+                    # 清理失败也完成不可用状态投影，监控继续等待用户恢复或退出。
                     self._lifecycle.deactivate()
-                    self._update({"voice_status": "error", "voice_error": str(exc), "active_reply_id": None,
+                    self._update({"voice_status": "error", "voice_error": error, "active_reply_id": None,
                                   "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
 
     def _conversation_event(self, event: dict[str, Any]) -> None:

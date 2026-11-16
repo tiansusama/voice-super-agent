@@ -51,6 +51,12 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   async function command(name: string) {
     try {
       await window.pywebview!.api.command(name);
+      if (name === 'restart_conversation') {
+        // 新对话恢复默认跟随，旧对话的上滚位置随成功重开结束。
+        followLatest.current = true;
+        setFollowing(true);
+        messagesRef.current!.scrollTop = messagesRef.current!.scrollHeight;
+      }
       setError('');
     } catch (reason) {
       setError(`操作失败：${String(reason)}`);
