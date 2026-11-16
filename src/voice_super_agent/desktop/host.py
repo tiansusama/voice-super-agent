@@ -20,6 +20,8 @@ user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
 user32.SetWindowLongW.restype = wintypes.LONG
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.GetDpiForWindow.restype = wintypes.UINT
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
 dwmapi = ctypes.WinDLL("dwmapi")
 dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 dwmapi.DwmSetWindowAttribute.restype = wintypes.LONG
@@ -138,8 +140,8 @@ class Desktop:
             return
         self._shape_floating()
         if layout[0]:
-            # focus=False 的原生样式持续保留，显示悬浮内容时键盘仍属于当前应用。
-            self.floating.native.Show()
+            # 通过原生免激活显示路径保留前台窗口，避免 Form.Show 主动选择悬浮窗。
+            user32.ShowWindow(self.floating.native.Handle.ToInt64(), 4)
         else:
             self.floating.native.Hide()
 

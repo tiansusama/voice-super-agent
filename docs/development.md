@@ -153,6 +153,8 @@ uv run --locked voice-super-agent --desktop-check
 
 ## 7 检查命令与问题定位
 
+完整集成验收、真实服务探测、Windows 原生检查及性能复现命令见[验收与测量记录](verification/stage-15.md#复现)，AC 覆盖见[验收矩阵](verification/stage-15-acceptance.md)。真实服务探测读取本地 `.env` 并产生服务调用，使用内存合成音频；真实收音/外放继续按人工验收安排执行。
+
 ```powershell
 npm --prefix frontend run typecheck
 uv run --locked pytest -q

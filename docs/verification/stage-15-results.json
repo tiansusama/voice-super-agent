@@ -1,0 +1,313 @@
+{
+  "date": "2026-11-16",
+  "base_revision": "e5421fa",
+  "branch": "feature/integration-validation",
+  "scope": "自动化、真实云服务接口与本机性能；真实收音、播放与设备切换待验收",
+  "python_tests": {
+    "passed": 186,
+    "seconds": 49.65,
+    "warnings": 4
+  },
+  "frontend_tests": {
+    "passed": 2
+  },
+  "pages": {
+    "passed": 22,
+    "checks": [
+      "待唤醒时保存新词立即反馈生效",
+      "活动语音分别显示有效词和待应用词",
+      "录入组合键使用物理键位及修饰键",
+      "组合键保存后更新有效值",
+      "正整数超时保存后更新有效值",
+      "小数秒由输入校验阻止提交",
+      "保存失败保留原有效配置并展示原因",
+      "首次按需加载20条历史",
+      "点击历史展开原文",
+      "分段加载可取得完整Unicode长原文",
+      "游标分页追加历史并显示加载完成",
+      "切换记录后迟到读取结果不会覆盖新原文",
+      "返回对话保留未发送草稿",
+      "浏览历史保留当前聊天消息",
+      "浏览历史不触发重开或模型输入",
+      "语音和模型不可用时仍可编辑设置",
+      "能力不可用时仍可读取历史",
+      "窄窗口历史页无横向溢出",
+      "窄窗口切换至原文并保留返回入口",
+      "窄窗口设置页无横向溢出",
+      "历史读取失败有原因和刷新入口",
+      "刷新后恢复历史浏览"
+    ]
+  },
+  "local": {
+    "measured_at": "2026-11-16T09:11:52.943709+00:00",
+    "python": "3.12.13",
+    "windows": "Windows-11-10.0.26200-SP0",
+    "logical_cpus": 16,
+    "physical_memory_gib": 23.291797637939453,
+    "history": [
+      {
+        "messages": 2000,
+        "dataset_utf8_bytes": 1517890,
+        "projected_bytes": 30897,
+        "list_ms": {
+          "n": 30,
+          "min": 0.23979999969014898,
+          "median": 0.30404999961319845,
+          "max": 0.5918999995628837,
+          "p95": 0.45012000045971945
+        },
+        "search_ms": {
+          "n": 30,
+          "min": 1.7680999990261625,
+          "median": 1.955449999513803,
+          "max": 3.5097999971185345,
+          "p95": 2.4706349986445275
+        },
+        "read_ms": {
+          "n": 30,
+          "min": 0.20940000104019418,
+          "median": 0.28265000037208665,
+          "max": 0.4628999995475169,
+          "p95": 0.4158649995588348
+        },
+        "context_ms": {
+          "n": 30,
+          "min": 0.4589000018313527,
+          "median": 0.537899999471847,
+          "max": 69.47980000040843,
+          "p95": 0.8346799999344512
+        }
+      },
+      {
+        "messages": 20000,
+        "dataset_utf8_bytes": 15198890,
+        "projected_bytes": 30926,
+        "list_ms": {
+          "n": 30,
+          "min": 0.3179000013915356,
+          "median": 0.4685500007326482,
+          "max": 0.6054000004951376,
+          "p95": 0.5902299993977067
+        },
+        "search_ms": {
+          "n": 30,
+          "min": 26.794499997777166,
+          "median": 28.43829999983427,
+          "max": 30.47809999770834,
+          "p95": 29.84222499981115
+        },
+        "read_ms": {
+          "n": 30,
+          "min": 0.5915000001550652,
+          "median": 0.7150000001274748,
+          "max": 1.1765999988710973,
+          "p95": 1.1236399983317824
+        },
+        "context_ms": {
+          "n": 30,
+          "min": 1.8918999994639307,
+          "median": 2.1472499993251404,
+          "max": 2.513399998861132,
+          "p95": 2.5024249996931758
+        }
+      }
+    ],
+    "kws": {
+      "initialization_ms": {
+        "n": 3,
+        "min": 1045.5709999987448,
+        "median": 1053.3983999994234,
+        "max": 1230.5492000014056
+      },
+      "input_audio_ms": 10000,
+      "batch_wall_ms": 217.03559999878053,
+      "batch_cpu_ms": 203.125,
+      "condition": "1000 个 10ms、16kHz、16bit 单声道静音块，批量离线处理，不打开音频设备"
+    }
+  },
+  "services": {
+    "llm": {
+      "status": "passed",
+      "samples": [
+        {
+          "scenario": "首次文字",
+          "first_text_ms": 943.7705999989703,
+          "completed_ms": 1122.6022000009834,
+          "answer": "已记住。",
+          "history_status": "idle"
+        },
+        {
+          "scenario": "共享上下文追问",
+          "first_text_ms": 706.0610999978962,
+          "completed_ms": 867.9771999995864,
+          "answer": "琥珀松鼠-7426",
+          "history_status": "idle"
+        },
+        {
+          "scenario": "重新开始后历史回读",
+          "first_text_ms": 637.4008999991929,
+          "completed_ms": 2737.06730000049,
+          "answer": "我先检索一下历史对话，找找“项目代号”相关的线索。琥珀松鼠-7426",
+          "history_status": "found"
+        }
+      ],
+      "restart_followup": "passed",
+      "tool_results": 2,
+      "tool_calls": [
+        "history_search",
+        "history_read"
+      ],
+      "measured_at": "2026-11-16T09:37:41.056303+00:00"
+    },
+    "tts": {
+      "status": "passed",
+      "samples": [
+        {
+          "first_audio_chunk_ms": 587.9820000009204,
+          "completed_ms": 1137.0408000002499,
+          "pcm_bytes": 183094
+        },
+        {
+          "first_audio_chunk_ms": 484.8113000007288,
+          "completed_ms": 1027.2847000014735,
+          "pcm_bytes": 182416
+        },
+        {
+          "first_audio_chunk_ms": 508.963299998868,
+          "completed_ms": 1075.466199999937,
+          "pcm_bytes": 191498
+        }
+      ],
+      "sample_rate": 24000,
+      "sentence": "这是语音接口验收，项目代号是琥珀松鼠。"
+    },
+    "system_one": {
+      "status": "passed",
+      "samples": [
+        {
+          "text": "嗯嗯，你继续。",
+          "decision": "backchannel",
+          "expected": "backchannel",
+          "correct": true,
+          "elapsed_ms": 299.59510000117007
+        },
+        {
+          "text": "等一下，我改一下。",
+          "decision": "interrupt",
+          "expected": "interrupt",
+          "correct": true,
+          "elapsed_ms": 235.39200000232086
+        },
+        {
+          "text": "先别说了。",
+          "decision": "interrupt",
+          "expected": "interrupt",
+          "correct": true,
+          "elapsed_ms": 259.20370000312687
+        }
+      ],
+      "classification_median_ms": 259.20370000312687
+    },
+    "asr": {
+      "status": "passed",
+      "samples": [
+        {
+          "ready_ms": 363.28340000181925,
+          "first_final_from_ready_ms": 4628.4341999999015,
+          "transcript": "这是语音接口验收，项目代号是琥珀松鼠。"
+        },
+        {
+          "ready_ms": 297.3597999989579,
+          "first_final_from_ready_ms": 6353.540799998882,
+          "transcript": "这是语音接口验收项目，代号是琥珀松鼠。"
+        },
+        {
+          "ready_ms": 310.8135000002221,
+          "first_final_from_ready_ms": 6217.074500000308,
+          "transcript": "这是语音接口验收项目，代号是琥珀松鼠。"
+        }
+      ],
+      "input": "真实 TTS 合成 PCM，重采样到16kHz并实时供帧；无麦克风"
+    }
+  },
+  "desktop": {
+    "condition": "本地 SSE 模型；受控语音消息、状态和音量；不收音、不播放",
+    "display": {
+      "width": 947,
+      "height": 645,
+      "devicePixelRatio": 2,
+      "dpi": 192
+    },
+    "local_stream_first_dom_ms": 118.77260000255774,
+    "resources": {
+      "main_visible_voice_off": {
+        "sample_seconds": 10,
+        "interval_ms": 500,
+        "mean_cpu_one_core_percent": 4.537619703500446,
+        "mean_cpu_machine_percent": 0.28360123146877786,
+        "mean_tree_private_mib": 879.9927734375,
+        "max_tree_rss_mib": 610.83984375,
+        "sample_count": 20,
+        "changed_processes": 0
+      },
+      "main_streaming_local_model": {
+        "sample_seconds": 10,
+        "interval_ms": 500,
+        "mean_cpu_one_core_percent": 26.589860844636735,
+        "mean_cpu_machine_percent": 1.661866302789796,
+        "mean_tree_private_mib": 941.325390625,
+        "max_tree_rss_mib": 676.80859375,
+        "sample_count": 20,
+        "changed_processes": 0
+      },
+      "main_hidden_voice_off": {
+        "sample_seconds": 10,
+        "interval_ms": 500,
+        "mean_cpu_one_core_percent": 5.131082667191104,
+        "mean_cpu_machine_percent": 0.320692666699444,
+        "mean_tree_private_mib": 970.41640625,
+        "max_tree_rss_mib": 686.83203125,
+        "sample_count": 20,
+        "changed_processes": 0
+      },
+      "floating_synthetic_levels_20hz": {
+        "sample_seconds": 10,
+        "interval_ms": 500,
+        "mean_cpu_one_core_percent": 57.50739911257773,
+        "mean_cpu_machine_percent": 3.594212444536108,
+        "mean_tree_private_mib": 976.809375,
+        "max_tree_rss_mib": 721.203125,
+        "sample_count": 20,
+        "changed_processes": 0
+      }
+    },
+    "checks": [
+      "生产前端经真实桥接启动",
+      "流式生成中发送文字保留旧片段",
+      "悬浮自动出现保持验证窗口焦点",
+      "持续音量更新保持验证窗口焦点",
+      "麦克风外环与五根播放音柱分别呈现",
+      "长回复限制卡片高度并跟随末尾",
+      "上滚后新增文字保持阅读位置",
+      "回到最新恢复跟随",
+      "收音球旁空白区域由原生形状裁去",
+      "悬停收音球同步可点击按钮区域",
+      "手动隐藏期间20Hz音量更新不重新弹出",
+      "手动隐藏后原生窗口确实不可见",
+      "找回后原生窗口确实可见",
+      "托盘命令可找回悬浮窗",
+      "隐藏后找回保持验证窗口焦点",
+      "悬浮错误保留问答并显示可用恢复入口",
+      "收音球结束按钮发出 end_voice",
+      "待唤醒收起悬浮窗",
+      "回待唤醒后原生窗口确实不可见",
+      "最小化恢复后内容连续",
+      "关闭主窗口后后台继续运行"
+    ],
+    "focus": {
+      "status": "passed",
+      "same_foreground_handle": true
+    },
+    "note": "资源取10秒/场景记录；原生21项最终回归包含实际可见性、错误入口与隐藏期间持续音量，单独运行"
+  }
+}
