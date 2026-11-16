@@ -28,6 +28,9 @@ class ConversationStore:
         if version < 2:
             script = Path(__file__).with_name("migrations") / "V1.0.0_002__index_history_reply.sql"
             self._connection.executescript(script.read_text(encoding="utf-8"))
+        if version < 3:
+            script = Path(__file__).with_name("migrations") / "V1.0.0_003__interaction_settings.sql"
+            self._connection.executescript(script.read_text(encoding="utf-8"))
         messages = [dict(row) for row in self._connection.execute("SELECT * FROM display_messages ORDER BY position")]
         records = [
             {"display_message_id": row["display_message_id"], "message": json.loads(row["message_json"])}
@@ -64,6 +67,40 @@ class ConversationStore:
                 "UPDATE working_window SET display_start_position=?, model_start_position=? WHERE id=1",
                 (window["display_start_position"], window["model_start_position"]),
             )
+
+    async def load_settings(self) -> dict:
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._load_settings)
+
+    def _load_settings(self) -> dict:
+        return {row["name"]: json.loads(row["value_json"])
+                for row in self._connection.execute("SELECT name, value_json FROM interaction_settings")}
+
+    async def save_settings(self, values: dict) -> None:
+        await asyncio.get_running_loop().run_in_executor(self._executor, self._save_settings, values)
+
+    def _save_settings(self, values: dict) -> None:
+        with self._connection:
+            self._connection.execute("DELETE FROM interaction_settings")
+            self._connection.executemany("INSERT INTO interaction_settings VALUES (?, ?)",
+                                         [(name, json.dumps(value, ensure_ascii=False)) for name, value in values.items()])
+
+    async def list_history(self, before_position: int | None = None, limit: int = 20) -> dict:
+        """按保存顺序从近到远浏览，游标翻页避免新消息插入造成重复或漏项。"""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("每页条数需要是 1～50 的整数。")
+        if before_position is not None and (type(before_position) is not int or before_position < 0):
+            raise ValueError("历史游标需要是非负整数。")
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._list_history, before_position, limit)
+
+    def _list_history(self, before_position, limit):
+        condition, arguments = ("", ()) if before_position is None else (" WHERE position < ?", (before_position,))
+        rows = self._connection.execute(
+            "SELECT position, id, role, source, reply_id, status, created_at, error, "
+            "substr(text, 1, 160) AS preview, length(text) AS total_characters FROM display_messages"
+            + condition + " ORDER BY position DESC LIMIT ?", (*arguments, limit + 1),
+        ).fetchall()
+        return {"messages": [dict(row) for row in rows[:limit]],
+                "next_before_position": rows[limit - 1]["position"] if len(rows) > limit else None}
 
     async def history_search(self, *, keywords: list[str] | None = None, start_time: str | None = None,
                              end_time: str | None = None, limit: int = 5, before_position: int | None = None,

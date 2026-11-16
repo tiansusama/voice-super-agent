@@ -29,6 +29,9 @@ interface DesktopSnapshot {
     wake_word: string;
     wake_hotkey: string;
     voice_idle_seconds: number;
+    pending_wake_word: string | null;
+    settings_error: string;
+    settings_saving: boolean;
     microphone_level: number;
     playback_level: number;
     microphone_device: string;
@@ -67,6 +70,27 @@ interface DesktopConnection extends DesktopSnapshot {
   view: 'main' | 'floating';
 }
 
+type SettingName = 'word' | 'hotkey' | 'idle_seconds';
+
+interface HistoryEntry extends Omit<ChatMessage, 'text'> {
+  position: number;
+  preview: string;
+  total_characters: number;
+}
+
+interface HistoryPage {
+  messages: HistoryEntry[];
+  next_before_position: number | null;
+}
+
+interface HistoryMessage extends ChatMessage {
+  position: number;
+  total_characters: number;
+}
+
+type HistoryOriginal = { status: 'found'; message: HistoryMessage; next_offset: number | null }
+  | { status: 'not_found'; message_id: string };
+
 interface Window {
   pywebview?: {
     api: {
@@ -74,6 +98,9 @@ interface Window {
       command(name: string): Promise<void>;
       send_text(text: string): Promise<{ user_message_id: string; reply_id: string }>;
       resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string }>;
+      save_setting(name: SettingName, value: string | number): Promise<{ pending: boolean }>;
+      list_history(before_position?: number): Promise<HistoryPage>;
+      read_history(message_id: string, offset?: number): Promise<HistoryOriginal>;
       floating_layout(card_height: number, controls_visible: boolean, hint_visible: boolean): Promise<void>;
     };
   };

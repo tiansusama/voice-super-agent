@@ -1,0 +1,48 @@
+.settings-page { padding-top: 26px; }
+.setting-card { max-width: 680px; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 16px; }
+.setting-card form { padding: 22px; }
+.setting-card form + form { border-top: 1px solid var(--line); }
+.setting-card label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.setting-card p { font-size: 12px; }
+.setting-input { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0 10px; }
+.setting-input input { flex: 1; min-width: 100px; width: 0; padding: 10px 12px; border: 1px solid #e0d5c9; border-radius: 9px; color: var(--ink); background: #fffdfb; font: inherit; font-size: 14px; }
+.setting-input input:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+.setting-input input[aria-invalid=true] { border-color: #a65335; }
+.setting-input input[type=number] { max-width: 140px; }
+.setting-input button { padding: 10px 12px; border-radius: 9px; }
+.setting-card small { display: block; color: var(--muted); font-size: 11px; line-height: 1.8; }
+.desktop-shell .setting-feedback { display: flex; align-items: center; gap: 5px; margin-top: 10px; color: #82613e; font-size: 12px; overflow-wrap: anywhere; }
+.desktop-shell .setting-feedback.failed, .history-entry-status.failed { color: #a14f34; }
+.desktop-shell .pending-setting { color: #a66d39; margin-top: 8px; font-size: 12px; }
+.history-view { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 18px 0; }
+.history-toolbar { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 12px; margin-bottom: 14px; }
+.history-toolbar p { font-size: 12px; }
+.history-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(230px, 0.85fr) minmax(0, 1.15fr); gap: 20px; }
+.history-list, .history-detail { min-width: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: #ddcfc1 transparent; }
+.history-list { padding-right: 6px; }
+.history-day { font-size: 12px; font-weight: 500; color: var(--muted); margin: 8px 0 12px; }
+.desktop-shell .history-entry { display: block; width: 100%; padding: 15px; margin-bottom: 10px; border: 1px solid var(--line); border-radius: 12px; background: #fffdfb; color: var(--ink); text-align: left; }
+.desktop-shell .history-entry:hover { background: #fcf5ed; }
+.desktop-shell .history-entry.selected { background: #faeee1; border-color: #dcb38f; }
+.history-entry-meta { display: flex; gap: 9px; align-items: center; color: var(--muted); font-size: 11px; }
+.history-entry-meta strong { color: var(--ink); font-size: 12px; margin-right: auto; }
+.history-preview { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; margin: 10px 0; font-size: 13px; line-height: 1.7; }
+.history-entry-status { color: #8c7e71; font-size: 10px; }
+.history-detail { padding: 18px 20px; border: 1px solid var(--line); border-radius: 14px; background: #fcf9f5; }
+.history-detail-heading { margin: 18px 0; }
+.history-detail-heading h2 { font-size: 18px; margin: 0 0 8px; font-weight: 600; }
+.history-detail-heading span { font-size: 11px; color: var(--muted); }
+.history-original { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.9; }
+.history-detail .history-character-count { margin: 18px 0 12px; font-size: 11px; }
+.history-more { padding: 8px 12px; margin: 8px 0; }
+.history-list .history-more { width: 100%; }
+.history-end { text-align: center; padding: 12px 0; font-size: 11px; }
+.history-placeholder, .history-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 26px; text-align: center; color: #ad855e; }
+.history-placeholder h2, .history-empty h2 { font-size: 16px; font-weight: 500; margin: 0; color: var(--ink); }
+.history-placeholder p, .history-empty p { font-size: 12px; }
+@media (max-width: 800px) {
+  .history-grid { grid-template-columns: minmax(0, 1fr); }
+  .history-grid.has-detail .history-list, .history-grid:not(.has-detail) .history-detail { display: none; }
+  .setting-card form { padding: 18px; }
+  .setting-input .record-hotkey { padding: 10px 8px; }
+}

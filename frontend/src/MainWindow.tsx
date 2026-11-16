@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, AudioLines, Check, CircleStop, Clock3, CornerDownLeft, History,
+import { ArrowDown, AudioLines, Check, CircleStop, Clock3, CornerDownLeft,
   MessageCircle, RotateCcw, SendHorizontal, Settings2, UserRound } from 'lucide-react';
+import { SettingsPanel } from './SettingsPanel';
+import { HistoryPanel } from './HistoryPanel';
+import './settings-history.css';
 
 export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSnapshot; connectionError: string }) {
   const [page, setPage] = useState<'chat' | 'history' | 'settings'>('chat');
@@ -121,6 +124,8 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
         </header>
 
         <div className="notices" aria-label="应用提示">
+          {state.settings_error && page !== 'settings' && <div className="notice warning" role="alert"><p>{state.settings_error}</p>
+            <button className="notice-action" onClick={() => setPage('settings')}>查看设置</button></div>}
           {state.voice_error && <div className="notice warning" role="alert"><p>{state.voice_error}</p>
             {state.voice_status === 'error' && <button className="notice-action" onClick={() => void command('recover_voice')}
               disabled={!canOperate || !state.model_available || state.voice_recovery === 'running'}>
@@ -199,28 +204,8 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
           </div>
         </div>
 
-        {page === 'history' && <section className="info-page" aria-label="历史记录">
-          <div className="page-intro"><span className="page-symbol"><History size={25} strokeWidth={1.5} /></span>
-            <h2>聊过的事，都可以再问问</h2><p>对话原文保存在本机。告诉小博具体的主题、关键词或大致时间，它会按需查找并回忆。</p></div>
-          <div className="info-card"><h3>接着之前的话题</h3><p>试着问：“我们之前讨论的唤醒方式是什么？”</p>
-            <button className="quiet-button" onClick={() => setPage('chat')}><MessageCircle size={17} />回到对话</button></div>
-          <p className="page-note">“重新开始”会腾空当前对话窗口，过去的内容仍可按需查询。</p>
-        </section>}
-
-        {page === 'settings' && <section className="info-page" aria-label="当前设置">
-          <div className="page-intro"><h2>让交流更顺手</h2><p>当前生效的语音设置</p></div>
-          <dl className="settings-list">
-            <div><dt>唤醒词<small>听到“叮”声后再说指令</small></dt><dd>{state.wake_word}</dd></div>
-            <div><dt>唤醒组合键<small>按住 1 秒，松开后继续交流</small></dt><dd><kbd>{state.wake_hotkey}</kbd></dd></div>
-            <div><dt>空闲超时<small>等待用户输入时计时，处理中暂停</small></dt><dd>{state.voice_idle_seconds} 秒</dd></div>
-          </dl>
-          <div className="info-card service-settings"><h3>模型与语音服务</h3><p>服务参数在项目的本地 .env 中配置，修改后重启应用生效。</p>
-            <dl><div><dt>对话模型</dt><dd>{state.model}</dd></div><div><dt>录音设备</dt><dd>{state.microphone_device || 'Windows 默认录音设备'}</dd></div>
-              <div><dt>播放设备</dt><dd>{state.playback_device || 'Windows 默认播放设备'}</dd></div></dl>
-            {state.audio_device_pending && <p role="status">默认设备已变化，下次唤醒时切换。</p>}</div>
-          <div className="window-actions"><button className="quiet-button" onClick={() => void command('hide_main')}>隐藏到托盘</button>
-            <button className="quiet-button" onClick={() => void command('quit')} disabled={state.exiting}>退出应用</button></div>
-        </section>}
+        {page === 'history' && <HistoryPanel />}
+        {page === 'settings' && <SettingsPanel state={state} command={command} />}
 
         {state.desktop_check && <section className="desktop-check"><details><summary>桌面联调 · 后台计数 {state.activity_tick} · 状态序号 {snapshot.sequence}</summary>
           <div className="actions"><button onClick={() => void command(state.activity_running ? 'stop_activity' : 'start_activity')}>

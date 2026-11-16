@@ -44,6 +44,15 @@ class DesktopApi:
     def resend_text(self, user_message_id: str):
         return self._runtime.resend_text(user_message_id)
 
+    def save_setting(self, name: str, value):
+        return self._runtime.save_setting(name, value)
+
+    def list_history(self, before_position: int | None = None):
+        return self._runtime.list_history(before_position)
+
+    def read_history(self, message_id: str, offset: int = 0):
+        return self._runtime.read_history(message_id, offset)
+
     def floating_layout(self, card_height: float, controls_visible: bool, hint_visible: bool) -> None:
         self._runtime.update_windows(floating_card_height=ceil(card_height),
                                      floating_controls_visible=controls_visible, floating_hint_visible=hint_visible)

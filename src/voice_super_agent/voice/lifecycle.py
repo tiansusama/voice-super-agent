@@ -9,12 +9,14 @@ class WakeSettings:
     idle_seconds: int = 60
 
     @classmethod
-    def from_environment(cls):
+    def from_environment(cls, saved: dict | None = None):
+        saved = {} if saved is None else saved
         try:
-            seconds = int(os.getenv("VOICE_IDLE_TIMEOUT_SECONDS", "60"))
+            seconds = int(saved.get("idle_seconds", os.getenv("VOICE_IDLE_TIMEOUT_SECONDS", "60")))
         except ValueError as exc:
             raise ValueError("语音空闲超时需要是大于 0 的整数秒。") from exc
-        settings = cls(os.getenv("VOICE_WAKE_WORD", "你好小博"), os.getenv("VOICE_WAKE_HOTKEY", "Ctrl+\\"), seconds)
+        settings = cls(saved.get("word", os.getenv("VOICE_WAKE_WORD", "你好小博")),
+                       saved.get("hotkey", os.getenv("VOICE_WAKE_HOTKEY", "Ctrl+\\")), seconds)
         if settings.idle_seconds <= 0:
             raise ValueError("语音空闲超时需要是大于 0 的整数秒。")
         return settings

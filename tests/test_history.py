@@ -54,7 +54,7 @@ async def test_existing_database_upgrade_preserves_history_context_and_window(tm
         assert (await store.history_search(keywords=["杭州"]))["matches"][0]["id"] == original["id"]
         assert (await store.history_read(message_id=original["id"]))["message"]["text"] == original["text"]
         with sqlite3.connect(path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
             assert "idx_display_messages_reply_position" in {row[1] for row in connection.execute("PRAGMA index_list(display_messages)")}
     finally:
         await store.close()

@@ -13,7 +13,7 @@ for (const restartFails of [false, true]) {
           model_available: true, model_error: '', model: 'test-model', active_reply_id: null,
           storage_status: 'saved', storage_error: '', exiting: false, voice_status: 'standby',
           voice_activity: 'listening', voice_error: '', wake_word: '你好小博', wake_hotkey: 'Ctrl+\\',
-          voice_idle_seconds: 60, microphone_level: 0, playback_level: 0, microphone_device: '',
+          voice_idle_seconds: 60, pending_wake_word: null, settings_error: '', settings_saving: false, microphone_level: 0, playback_level: 0, microphone_device: '',
           playback_device: '', audio_device_pending: false, playback_stop_ms: 0, last_error: null,
           voice_recovery: 'idle', history_status: 'idle', history_reply_id: null, history_error: '',
           restarting: false, exit_error: '',
@@ -32,6 +32,9 @@ for (const restartFails of [false, true]) {
         },
         send_text: async () => { throw new Error('本用例通过语音状态推送消息'); },
         resend_text: async () => { throw new Error('本用例不触发重发'); },
+        save_setting: async () => { throw new Error('本用例不修改设置'); },
+        list_history: async () => { throw new Error('本用例不浏览历史'); },
+        read_history: async () => { throw new Error('本用例不读取原文'); },
         floating_layout: async () => { throw new Error('主窗口不报告悬浮布局'); },
       } };
     }, restartFails);

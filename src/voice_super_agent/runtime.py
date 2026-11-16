@@ -39,6 +39,10 @@ class Runtime:
         self._voice_task: asyncio.Task | None = None
         self._wake_model_dir = wake_model_dir
         self._wake_settings = WakeSettings()
+        self._settings_values: dict = {}
+        self._configuration_error = ""
+        self._pending_detector: KeywordDetector | None = None
+        self._hotkey = HoldHotkey(self._wake_settings.hotkey)
         self._lifecycle = VoiceLifecycle()
         self._detector: KeywordDetector | None = None
         self._hotkey_task: asyncio.Task | None = None
@@ -90,6 +94,9 @@ class Runtime:
             "wake_word": "你好小博",
             "wake_hotkey": "Ctrl+\\",
             "voice_idle_seconds": 60,
+            "pending_wake_word": None,
+            "settings_error": "",
+            "settings_saving": False,
             "microphone_level": 0.0,
             "playback_level": 0.0,
             "microphone_device": "",
@@ -113,11 +120,22 @@ class Runtime:
     async def _initialize(self) -> None:
         try:
             saved = await self._store.open()
+            self._settings_values = await self._store.load_settings()
         except (sqlite3.Error, OSError) as exc:
             logger.exception("读取对话失败")
             self._state.update(storage_status="error", storage_error=f"读取对话失败：{exc}。本次未恢复记录，已暂停新消息。")
             return
         self._storage_ready = True
+        try:
+            self._wake_settings = WakeSettings.from_environment(self._settings_values)
+            self._hotkey = HoldHotkey(self._wake_settings.hotkey)
+        except ValueError as exc:
+            self._configuration_error = f"交互配置无效：{exc}"
+            self._state.update(settings_error=self._configuration_error, voice_status="error", voice_error=self._configuration_error)
+        self._lifecycle.idle_seconds = self._wake_settings.idle_seconds
+        self._state.update(wake_word=self._wake_settings.word, wake_hotkey=self._wake_settings.hotkey,
+                           voice_idle_seconds=self._wake_settings.idle_seconds,
+                           pending_wake_word=self._settings_values.get("pending_word"))
         self._messages = {message["id"]: message for message in saved["messages"]}
         self._user_ids = {message["reply_id"]: message["id"] for message in saved["messages"]
                           if message["role"] == "user" and message["status"] != "backchannel"}
@@ -172,6 +190,110 @@ class Runtime:
     def _snapshot(self) -> dict[str, Any]:
         return {"sequence": self._sequence, "state": dict(self._state),
                 "messages": [dict(message) for message in self._messages.values()][self._window["display_start_position"]:]}
+
+    def save_setting(self, name: str, value: Any) -> dict:
+        return asyncio.run_coroutine_threadsafe(self._save_setting(name, value), self._loop).result()
+
+    async def _save_setting(self, name: str, value: Any) -> dict:
+        if self._state["settings_saving"]:
+            raise ValueError("正在保存设置，请等待。")
+        self._update({"settings_saving": True, "settings_error": ""})
+        try:
+            async with self._execution_lock:
+                if not self._storage_ready or self._state["exiting"] or self._state["restarting"]:
+                    raise ValueError("请等待应用准备完成后保存设置。")
+                if name not in {"word", "hotkey", "idle_seconds"}:
+                    raise ValueError("未知交互设置。")
+                if name == "idle_seconds":
+                    if type(value) is not int or value <= 0:
+                        raise ValueError("语音空闲超时需要是大于 0 的整数秒。")
+                elif not isinstance(value, str) or not value.strip():
+                    raise ValueError("请输入有效的唤醒词或组合键。")
+                else:
+                    value = value.strip()
+                values = dict(self._settings_values)
+                detector = None
+                if name == "word" and value != self._wake_settings.word:
+                    if self._wake_model_dir is None:
+                        raise ValueError("当前运行方式未配置本地唤醒模型目录。")
+                    detector = await asyncio.to_thread(KeywordDetector, self._wake_model_dir, value)
+                    values.setdefault("word", self._wake_settings.word)
+                    values["pending_word"] = value
+                else:
+                    values[name] = value
+                    if name == "word":
+                        values.pop("pending_word", None)
+                configured = WakeSettings.from_environment(values)
+                hotkey = HoldHotkey(configured.hotkey)
+                # 先完成事务，再更换热键、期限及待应用检测器；失败时旧运行状态继续生效。
+                await self._store.save_settings(values)
+                self._settings_values = values
+                self._configuration_error = ""
+                if name == "word":
+                    self._pending_detector = detector
+                    self._update({"pending_wake_word": values.get("pending_word")})
+                    if self._state["voice_status"] == "standby" and not await self._apply_pending_word():
+                        raise ValueError(self._state["settings_error"])
+                elif name == "hotkey":
+                    self._wake_settings.hotkey = configured.hotkey
+                    self._hotkey = hotkey
+                    self._update({"wake_hotkey": configured.hotkey})
+                else:
+                    self._wake_settings.idle_seconds = configured.idle_seconds
+                    self._lifecycle.idle_seconds = configured.idle_seconds
+                    self._lifecycle.deadline = (self._loop.time() + configured.idle_seconds
+                                               if self._lifecycle.active and not self._lifecycle.busy else None)
+                    self._update({"voice_idle_seconds": configured.idle_seconds})
+                return {"pending": name == "word" and self._state["pending_wake_word"] is not None}
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+            message = f"设置未生效：{exc}"
+            self._update({"settings_error": message})
+            raise ValueError(message) from exc
+        finally:
+            self._update({"settings_saving": False})
+
+    async def _apply_pending_word(self) -> bool:
+        word = self._settings_values.get("pending_word")
+        if word is None:
+            return True
+        try:
+            detector = self._pending_detector
+            if detector is None:
+                detector = await asyncio.to_thread(KeywordDetector, self._wake_model_dir, word)
+            values = {**self._settings_values, "word": word}
+            del values["pending_word"]
+            if self._conversation is not None and self._conversation.voice_enabled:
+                gate = self._conversation._voice.gate
+                async with gate._decode_lock:
+                    await self._store.save_settings(values)
+                    gate.detector = detector
+            else:
+                await self._store.save_settings(values)
+            self._detector = detector
+            self._settings_values = values
+            self._wake_settings.word = word
+            self._pending_detector = None
+            self._update({"wake_word": word, "pending_wake_word": None, "settings_error": ""})
+            return True
+        except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+            self._update({"settings_error": f"唤醒词应用失败：{exc}。当前继续使用“{self._wake_settings.word}”。"})
+            return False
+
+    def list_history(self, before_position: int | None = None) -> dict:
+        return asyncio.run_coroutine_threadsafe(self._browse_history(before_position), self._loop).result()
+
+    async def _browse_history(self, before_position) -> dict:
+        if not self._storage_ready or not await asyncio.shield(self._flush()):
+            raise ValueError(self._state["storage_error"])
+        return await self._store.list_history(before_position)
+
+    def read_history(self, message_id: str, offset: int = 0) -> dict:
+        return asyncio.run_coroutine_threadsafe(self._read_history(message_id, offset), self._loop).result()
+
+    async def _read_history(self, message_id: str, offset: int) -> dict:
+        if not self._storage_ready or not await asyncio.shield(self._flush()):
+            raise ValueError(self._state["storage_error"])
+        return await self._store.history_read(message_id=message_id, offset=offset, limit=8000)
 
     def send_text(self, text: str) -> dict[str, str]:
         return asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop).result()
@@ -317,13 +439,11 @@ class Runtime:
                             self._conversation is None or not self._conversation.voice_enabled
                             or self._conversation._runner_task.done()):
                         self._require_voice_configuration()
-                        self._wake_settings = WakeSettings.from_environment()
-                        hotkey = HoldHotkey(self._wake_settings.hotkey)
                         self._lifecycle.idle_seconds = self._wake_settings.idle_seconds
                         await self._close_conversation()
                         await self._prepare_voice_conversation()
                         if self._hotkey_task is None or self._hotkey_task.done():
-                            self._hotkey_task = asyncio.create_task(self._watch_hotkey(hotkey), name="wake-hotkey")
+                            self._hotkey_task = asyncio.create_task(self._watch_hotkey(), name="wake-hotkey")
                         self._update({"wake_word": self._wake_settings.word, "wake_hotkey": self._wake_settings.hotkey,
                                       "voice_idle_seconds": self._wake_settings.idle_seconds})
                     if enabled:
@@ -341,6 +461,7 @@ class Runtime:
                         if not self._state["storage_error"]:
                             await self._use_default_audio()
                         self._lifecycle.deactivate()
+                        await self._apply_pending_word()
                         for message in self._messages.values():
                             if message["status"] in {"queued", "thinking", "streaming"}:
                                 message["status"] = "unfinished"
@@ -389,6 +510,7 @@ class Runtime:
                               "voice_recovery": "failed" if recovering else self._state["voice_recovery"]})
 
     async def _prepare_voice_conversation(self):
+        await self._apply_pending_word()
         if self._detector is None:
             self._detector = await asyncio.to_thread(KeywordDetector, self._wake_model_dir, self._wake_settings.word)
         if not await self._flush():
@@ -401,13 +523,16 @@ class Runtime:
         self._conversation._voice.gate.mode = "standby"
 
     def _require_voice_configuration(self):
+        if self._configuration_error:
+            raise ValueError(self._configuration_error)
         missing = [name for name in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY")
                    if not os.getenv(name, "").strip()]
         if missing:
             raise ValueError("缺少语音配置：" + "、".join(missing))
 
-    async def _watch_hotkey(self, hotkey):
+    async def _watch_hotkey(self):
         while True:
+            hotkey = self._hotkey
             if hotkey.sample(hotkey.pressed(), self._loop.time()) and self._state["voice_status"] == "standby":
                 await self._command("wake_voice")
             await asyncio.sleep(0.02)
@@ -797,8 +922,7 @@ class Runtime:
                         if self._wake_model_dir is not None:
                             await self._prepare_voice_conversation()
                             if self._hotkey_task is None or self._hotkey_task.done():
-                                hotkey = HoldHotkey(self._wake_settings.hotkey)
-                                self._hotkey_task = asyncio.create_task(self._watch_hotkey(hotkey), name="wake-hotkey")
+                                self._hotkey_task = asyncio.create_task(self._watch_hotkey(), name="wake-hotkey")
                         else:
                             self._conversation = self._create_conversation(voice=True)
                             await self._conversation.start()
