@@ -103,3 +103,63 @@ def test_closing_preparation_window_cancels_owned_process_tree(delivery, tmp_pat
         if process.poll() is None:
             subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
             process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("failure", ["readonly_log", "directory_collision"])
+def test_preparation_io_failure_shows_specific_error_and_exits(delivery, tmp_path, failure):
+    root, environment = delivery
+    log = root / ".local/logs/setup.log"
+    if failure == "readonly_log":
+        log.parent.mkdir(parents=True)
+        log.write_text("existing log\n", encoding="utf-8")
+        os.chmod(log, 0o444)
+    else:
+        (root / ".local").write_text("occupied path", encoding="utf-8")
+    process = subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File",
+                                str(root / "scripts/start.ps1")], cwd=tmp_path, env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    dialogs = []
+    texts = []
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and process.poll() is None:
+            def inspect(handle, _):
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+                text = ctypes.create_unicode_buffer(2048)
+                user32.GetWindowTextW(handle, text, len(text))
+                if pid.value == process.pid and text.value == "准备未完成":
+                    dialogs.append(handle)
+                return True
+            user32.EnumWindows(callback_type(inspect), 0)
+            if dialogs:
+                break
+            time.sleep(.05)
+        assert dialogs, "准备错误没有进入应用的失败提示"
+
+        def collect(handle, _):
+            text = ctypes.create_unicode_buffer(2048)
+            user32.GetWindowTextW(handle, text, len(text))
+            texts.append(text.value)
+            return True
+        user32.EnumChildWindows.argtypes = [wintypes.HWND, callback_type, wintypes.LPARAM]
+        user32.EnumChildWindows(dialogs[0], callback_type(collect), 0)
+        content = "\n".join(texts)
+        assert "启动准备失败" in content and "重新双击 start.cmd" in content
+        assert ("setup.log" if failure == "readonly_log" else ".local") in content
+        assert "Continue" not in content
+        assert not Path(environment["DELIVERY_CALLS"]).exists()
+        assert user32.PostMessageW(dialogs[0], 0x0010, 0, 0)
+        output, error = process.communicate(timeout=10)
+        assert process.returncode == 1, (output, error)
+    finally:
+        if process.poll() is None:
+            subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
+            process.communicate(timeout=10)
+        if failure == "readonly_log":
+            os.chmod(log, 0o666)

@@ -24,7 +24,6 @@ if (-not $preparation.WaitOne(0)) {
 
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $logDirectory = Join-Path $projectRoot '.local/logs'
-New-Item -ItemType Directory -Force $logDirectory | Out-Null
 $logPath = Join-Path $logDirectory 'setup.log'
 $script:prepareProcess = $null
 $script:preparing = $true
@@ -78,79 +77,92 @@ $form.Add_FormClosing({
     }
 })
 $form.Add_Shown({
-    foreach ($command in @('git', 'uv', 'node', 'npm')) {
-        if ($null -eq (Get-Command $command -ErrorAction SilentlyContinue)) {
-            [void][System.Windows.Forms.MessageBox]::Show("缺少 $command，请先按 docs/development.md 安装开发工具后重新启动。", '准备未完成')
-            $script:preparing = $false
-            $form.Close()
-            return
+    try {
+        New-Item -ItemType Directory -Force $logDirectory | Out-Null
+        foreach ($command in @('git', 'uv', 'node', 'npm')) {
+            if ($null -eq (Get-Command $command -ErrorAction SilentlyContinue)) {
+                [void][System.Windows.Forms.MessageBox]::Show("缺少 $command，请先按 docs/development.md 安装开发工具后重新启动。", '准备未完成')
+                $script:preparing = $false
+                $form.Close()
+                return
+            }
         }
-    }
-    for ($index = 0; $index -lt $steps.Count; $index++) {
-        $step = $steps[$index]
-        $status.Text = "$($index + 1)/$($steps.Count)  $($step.Label)"
-        $progress.Value = $index
+        for ($index = 0; $index -lt $steps.Count; $index++) {
+            $step = $steps[$index]
+            $status.Text = "$($index + 1)/$($steps.Count)  $($step.Label)"
+            $progress.Value = $index
+            $form.Refresh()
+            Add-Content -LiteralPath $logPath -Value "`n$(Get-Date -Format o) $($step.Name)" -Encoding UTF8
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $process.StartInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'prepare-dev.ps1') + '" -Step ' + $step.Name
+            $process.StartInfo.WorkingDirectory = $projectRoot
+            $process.StartInfo.UseShellExecute = $false
+            $process.StartInfo.CreateNoWindow = $true
+            $process.StartInfo.RedirectStandardOutput = $true
+            $process.StartInfo.RedirectStandardError = $true
+            $process.StartInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $process.StartInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            [void]$process.Start()
+            $script:prepareProcess = $process
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $process.HasExited) {
+                $detail.Text = "当前步骤已用时 $([int]$elapsed.Elapsed.TotalSeconds) 秒。首次准备需要下载依赖或模型，请保持网络连接。"
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 100
+            }
+            $process.WaitForExit()
+            Add-Content -LiteralPath $logPath -Value ($stdout.Result + $stderr.Result) -Encoding UTF8
+            $code = $process.ExitCode
+            $process.Dispose()
+            $script:prepareProcess = $null
+            if ($script:cancelled) { return }
+            if ($code -ne 0) {
+                $script:preparing = $false
+                [void][System.Windows.Forms.MessageBox]::Show("$($step.Label)失败。请查看日志：`n$logPath`n`n处理原因后重新双击 start.cmd。", '准备未完成')
+                $form.Close()
+                return
+            }
+            $progress.Value = $index + 1
+        }
+        $status.Text = '准备完成，正在启动小博…'
+        $detail.Text = '正在打开桌面，首次加载可能需要几秒钟。'
         $form.Refresh()
-        Add-Content -LiteralPath $logPath -Value "`n$(Get-Date -Format o) $($step.Name)" -Encoding UTF8
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $process.StartInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $PSScriptRoot 'prepare-dev.ps1') + '" -Step ' + $step.Name
-        $process.StartInfo.WorkingDirectory = $projectRoot
-        $process.StartInfo.UseShellExecute = $false
-        $process.StartInfo.CreateNoWindow = $true
-        $process.StartInfo.RedirectStandardOutput = $true
-        $process.StartInfo.RedirectStandardError = $true
-        $process.StartInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $process.StartInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-        [void]$process.Start()
-        $script:prepareProcess = $process
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
-        while (-not $process.HasExited) {
-            $detail.Text = "当前步骤已用时 $([int]$elapsed.Elapsed.TotalSeconds) 秒。首次准备需要下载依赖或模型，请保持网络连接。"
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 100
+        $env:UV_PROJECT_ENVIRONMENT = Join-Path $projectRoot '.venv'
+        $arguments = 'run --project "' + $projectRoot + '" --no-sync --offline "' + (Join-Path $projectRoot 'desktop.pyw') + '"'
+        $script:prepareProcess = Start-Process -FilePath (Get-Command uv).Source -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
+        $activated = $false
+        # 等待应用接过单实例通知，覆盖准备窗口关闭到 Python 初始化之间的交接。
+        while (-not $script:prepareProcess.HasExited) {
+            try {
+                $activation = [System.Threading.EventWaitHandle]::OpenExisting('Local\VoiceSuperAgent.Activate')
+                $activation.Dispose()
+                $activated = $true
+                break
+            } catch [System.Threading.WaitHandleCannotBeOpenedException] {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 100
+            }
+            if ($script:cancelled) { return }
         }
-        $process.WaitForExit()
-        Add-Content -LiteralPath $logPath -Value ($stdout.Result + $stderr.Result) -Encoding UTF8
-        $code = $process.ExitCode
-        $process.Dispose()
+        $script:prepareProcess.Dispose()
         $script:prepareProcess = $null
-        if ($script:cancelled) { return }
-        if ($code -ne 0) {
-            $script:preparing = $false
-            [void][System.Windows.Forms.MessageBox]::Show("$($step.Label)失败。请查看日志：`n$logPath`n`n处理原因后重新双击 start.cmd。", '准备未完成')
-            $form.Close()
-            return
+        $script:preparing = $false
+        $script:exitCode = if ($activated) { 0 } else { 1 }
+        $form.Close()
+    } catch [System.IO.IOException], [System.UnauthorizedAccessException], [System.ComponentModel.Win32Exception], [System.InvalidOperationException] {
+        $failure = $_.Exception.Message
+        # 关闭准备窗口先终止本次子进程，再显示具体失败原因并退出。
+        $form.Close()
+        [void][System.Windows.Forms.MessageBox]::Show("启动准备失败：$failure`n`n处理原因后重新双击 start.cmd。", '准备未完成')
+    } finally {
+        if ($null -ne $script:prepareProcess) {
+            $script:prepareProcess.Dispose()
+            $script:prepareProcess = $null
         }
-        $progress.Value = $index + 1
     }
-    $status.Text = '准备完成，正在启动小博…'
-    $detail.Text = '正在打开桌面，首次加载可能需要几秒钟。'
-    $form.Refresh()
-    $env:UV_PROJECT_ENVIRONMENT = Join-Path $projectRoot '.venv'
-    $arguments = 'run --project "' + $projectRoot + '" --no-sync --offline "' + (Join-Path $projectRoot 'desktop.pyw') + '"'
-    $script:prepareProcess = Start-Process -FilePath (Get-Command uv).Source -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
-    $activated = $false
-    # 等待应用接过单实例通知，覆盖准备窗口关闭到 Python 初始化之间的交接。
-    while (-not $script:prepareProcess.HasExited) {
-        try {
-            $activation = [System.Threading.EventWaitHandle]::OpenExisting('Local\VoiceSuperAgent.Activate')
-            $activation.Dispose()
-            $activated = $true
-            break
-        } catch [System.Threading.WaitHandleCannotBeOpenedException] {
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 100
-        }
-        if ($script:cancelled) { return }
-    }
-    $script:prepareProcess.Dispose()
-    $script:prepareProcess = $null
-    $script:preparing = $false
-    $script:exitCode = if ($activated) { 0 } else { 1 }
-    $form.Close()
 })
 try {
     [void]$form.ShowDialog()
