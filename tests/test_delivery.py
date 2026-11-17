@@ -1,9 +1,12 @@
 import ctypes
 from ctypes import wintypes
+import io
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import time
 
 import psutil
@@ -52,6 +55,54 @@ def test_prepare_from_other_directory_preserves_configuration_and_installs_missi
     assert (root / ".env").read_text(encoding="utf-8") == "DEEPSEEK_API_KEY=existing-value\n"
 
 
+def test_prepare_reinstalls_missing_transitive_frontend_dependency(delivery, tmp_path):
+    root, environment = delivery
+    frontend = root / "frontend"
+    frontend.mkdir()
+    packages = {
+        "b": ({"name": "b", "version": "1.0.0"}, "module.exports = 'ready';\n"),
+        "a": ({"name": "a", "version": "1.0.0",
+               "dependencies": {"b": f"file:{(frontend / 'b.tgz').as_posix()}"}},
+              "module.exports = require('b');\n"),
+    }
+    # 本地包提供真实的传递依赖，回归过程通过 npm 离线安装验证自动修复。
+    for name, (manifest, source) in packages.items():
+        with tarfile.open(frontend / f"{name}.tgz", "w:gz") as archive:
+            for filename, content in (("package.json", json.dumps(manifest)), ("index.js", source)):
+                data = content.encode("utf-8")
+                entry = tarfile.TarInfo(f"package/{filename}")
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+    (frontend / "package.json").write_text(json.dumps({
+        "name": "delivery-fixture", "version": "1.0.0", "private": True,
+        "dependencies": {"a": "file:./a.tgz"},
+        "scripts": {"build": "node -e \"console.log(require('a'))\""},
+    }), encoding="utf-8")
+    npm = shutil.which("npm.cmd")
+    locked = subprocess.run([npm, "install", "--package-lock-only", "--offline", "--ignore-scripts",
+                             "--no-audit", "--no-fund"], cwd=frontend,
+                            capture_output=True, text=True, encoding="utf-8", timeout=20)
+    assert locked.returncode == 0, locked.stderr
+    direct = frontend / "node_modules/a"
+    direct.mkdir(parents=True)
+    (direct / "package.json").write_text(json.dumps(packages["a"][0]), encoding="utf-8")
+    (direct / "index.js").write_text(packages["a"][1], encoding="utf-8")
+    shallow = subprocess.run([npm, "ls", "--depth=0"], cwd=frontend,
+                             capture_output=True, text=True, encoding="utf-8", timeout=20)
+    assert shallow.returncode == 0, shallow.stderr
+    (tmp_path / "tools/npm.cmd").write_text(
+        '@echo off\necho npm %*>>"%DELIVERY_CALLS%"\n'
+        f'call "{npm}" %*\nexit /b %errorlevel%\n', encoding="utf-8")
+    environment["npm_config_offline"] = "true"
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                             str(root / "scripts/prepare-dev.ps1")], cwd=tmp_path, env=environment,
+                            capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    calls = Path(environment["DELIVERY_CALLS"]).read_text(encoding="utf-8")
+    assert " ci " in calls and "run build" in calls and "Model" in calls
+    assert "ready" in result.stdout
+
+
 @pytest.mark.parametrize("failure,code", [("DELIVERY_FAIL_UV", 17), ("DELIVERY_FAIL_NPM", 23)])
 def test_prepare_stops_after_failure_and_keeps_later_steps_unstarted(delivery, tmp_path, failure, code):
     root, environment = delivery
@@ -97,7 +148,8 @@ def test_closing_preparation_window_cancels_owned_process_tree(delivery, tmp_pat
         assert user32.PostMessageW(handles[0], 0x0010, 0, 0)
         output, error = process.communicate(timeout=10)
         assert process.returncode == 1, (output, error)
-        assert all(not child.is_running() for child in children)
+        _, alive = psutil.wait_procs(children, timeout=5)
+        assert not alive
         assert "npm" not in Path(environment["DELIVERY_CALLS"]).read_text(encoding="utf-8")
     finally:
         if process.poll() is None:

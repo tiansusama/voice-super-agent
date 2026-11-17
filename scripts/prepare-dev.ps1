@@ -21,7 +21,7 @@ foreach ($current in $steps) {
             }
         }
         'Frontend' {
-            npm --prefix $frontend ls --depth=0
+            npm --prefix $frontend ls --all
             if ($LASTEXITCODE -ne 0) {
                 npm --prefix $frontend ci --no-audit --no-fund
                 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
