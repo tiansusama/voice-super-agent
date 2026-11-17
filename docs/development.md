@@ -1,6 +1,8 @@
 # 开发运行
 
-当前已接入 STS 语音链路、本地唤醒、组合键、结束语音、空闲超时、AEC、默认设备生命周期、语音/文字双向接管、故障恢复及失败文字重发。实现与自动化验证已完成，真实语音、外放、设备切换、交错输入和恢复演示待验收，结果见[语音链路记录](plan/V1.0.0/05-sts-voice.md)、[唤醒记录](verification/stage-06.md)、[音频设备记录](verification/stage-07.md)、[输入接管记录](verification/stage-08.md)及[恢复与重发记录](verification/stage-09.md)。页面启动和读取已保存记录无需模型凭据，发送文字需要配置 DeepSeek。
+当前已接入 STS 语音链路、本地唤醒、组合键、结束语音、空闲超时、AEC、默认设备生命周期、语音/文字双向接管、故障恢复及失败文字重发。自动化、真实服务接口和部分 Windows 检查已完成；真实语音、外放、设备切换及声学响应继续待验收，结果见[集成验收](verification/stage-15.md)、[审查修复](verification/review-fixes-2026-11-16.md)及[独立开发交付记录](verification/stage-16.md)。页面启动和读取已保存记录无需模型凭据，发送文字需要配置 DeepSeek。
+
+首次使用推荐双击根目录 **`start.cmd`**，由进度窗口自动完成项目准备并启动。环境要求和详细流程如下。
 
 在已准备好的项目根目录启动桌面：
 
@@ -13,17 +15,48 @@ uv run --locked voice-super-agent
 ## 1 环境
 
 - Windows 11 x64。
-- uv，项目使用 Python 3.12，通过 `.python-version` 与 `requires-python` 指定。
+- [Git for Windows](https://git-scm.com/download/win)，供克隆与 uv 的 Git 依赖安装使用。
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)，本机验证版本为 0.11.16。Python 3.12 由 `.python-version` 与 `requires-python` 指定，uv 可以自动准备所需解释器，无需另建系统 Python 环境。
 - Node.js 20.19 及以上的 20.x，或 22.12 及以上版本；本机准备时使用 Node.js 24。
-- Microsoft Edge WebView2 Runtime 和 .NET Framework 4.6.2 及以上，供 pywebview 的 EdgeChromium 宿主使用。
+- [Node.js/npm](https://nodejs.org/en/download) 应可在新终端中运行；本轮实测为 Node.js 24.13.1、npm 11.10.0。前端兼容范围由 `frontend/package.json` 的 `engines` 声明。
+- [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) 和 .NET Framework 4.6.2 及以上，供 pywebview 的 EdgeChromium 宿主使用。
+- Windows 自带的 Windows PowerShell 5.1；准备窗口使用 WinForms，脚本带 UTF-8 BOM 以支持中文。工作副本所在目录需要可写，并在首次准备时可以访问依赖及模型下载源。
 
 Python 依赖由 uv 管理，前端使用 npm。以下命令均从项目根目录运行。
 
 ## 2 首次准备
 
+### 双击自动准备
+
+克隆后双击 `start.cmd`。入口按自己的文件位置定位工作副本，从其他目录运行或路径中包含空格、中文也可使用。准备窗口显示当前步骤、已完成步骤数和当前步骤用时，进度条表示四个步骤的完成情况：
+
+1. `uv sync --locked`：准备本项目 `.venv` 和锁定依赖；缺少 `.env` 时从示例生成，已有文件继续保留。
+2. 用 `npm ls --depth=0` 检查界面依赖；缺失或版本不满足时执行 `npm ci`。
+3. 运行前端类型检查和构建，生成 `frontend/dist`，以当前源码重新准备界面。
+4. 缺少必需 KWS 文件时下载和解包官方模型；文件已齐时直接复用。
+
+完成后由 uv 在本项目环境中运行 `desktop.pyw`，日志写入 `.local/logs/desktop.log`。正常桌面运行不保留终端窗口。准备失败会指出失败步骤和 `setup.log` 位置，处理原因后重新双击即可；关闭准备窗口会终止本次准备的子进程树，再次启动可以重新准备。
+
+已运行时重复双击直接通知原实例显示主窗口，不重复构建。准备期间重复双击会提示已有准备窗口。Git、uv、Node/npm 和 WebView2 属于机器准备条件；入口会提示缺失的命令，项目依赖与模型由准备脚本安装。
+
+首次生成的 `.env` 中密钥为空，主窗口会显示能力缺失的具体原因。按下方字段说明填写自己的服务凭据，再明确退出并重新启动。
+
+### 终端准备
+
+在项目根目录一次完成同样的四个步骤：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-dev.ps1
+uv run --locked voice-super-agent
+```
+
+需要单独准备某一步时，可以使用 `-Step Python`、`-Step Frontend`、`-Step Build` 或 `-Step Model`。也可逐项执行：
+
 ```powershell
 uv sync --locked
 npm --prefix frontend ci
+npm --prefix frontend run build
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-wake-model.ps1
 ```
 
 Pipecat 依赖声明来自官方 Git 仓库，使用 STS 对应提交 `de8998789d5690073ddd1dafcec7268839af8153`。第一次安装需要 Git 与网络，uv 会把源码放入自己的缓存并安装到本项目 `.venv`。所需版本由 `uv.lock` 记录，运行不使用旁边 STS 的源码或 `.venv`。
@@ -36,7 +69,20 @@ Pipecat 依赖声明来自官方 Git 仓库，使用 STS 对应提交 `de8998789
 
 语音联调还需要 `VOLCENGINE_API_KEY` 和 `ARK_API_KEY`，分别用于火山识别/合成与 System One。缺少语音配置时开发入口显示原因，文字对话继续使用自身配置。
 
-启用语音前，从项目根目录执行 `./scripts/prepare-wake-model.ps1`。正常启动后程序使用默认麦克风进行本地检测，进入“待唤醒”；此时云端 ASR 未连接。说“你好小博”、按住 `Ctrl + \` 一秒，或点击主窗口“唤醒语音”，均可进入准备。云端 ASR 确认就绪后，经同一音频输出队列播放“叮”声，播放完成才开放指令输入。当前真实语音联调先使用耳机。
+双击自动准备已包含唤醒模型，单独下载可运行 `scripts/prepare-wake-model.ps1`。语音服务参数、模型和设备均具备条件时，正常启动会使用默认麦克风进行本地检测，进入“待唤醒”；此时云端 ASR 未连接。说“你好小博”、按住 `Ctrl + \` 一秒，或点击主窗口“唤醒语音”，均可进入准备。云端 ASR 确认就绪后，经同一音频输出队列播放“叮”声，播放完成才开放指令输入。真实收音和外放仍待后续安排验收。
+
+### 配置字段与生效规则
+
+| 字段 | 用途与默认值 | 生效方式 |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 文字与语音共同使用的模型凭据，无默认密钥 | `.env` 修改后重启 |
+| `DEEPSEEK_MODEL` | 默认 `deepseek-flash` | `.env` 修改后重启 |
+| `DEEPSEEK_BASE_URL` | 默认 `https://api.deepseek.com/v1` | `.env` 修改后重启 |
+| `VOLCENGINE_API_KEY` | 火山 ASR、TTS 凭据，无默认密钥 | `.env` 修改后重启 |
+| `ARK_API_KEY` | System One 判意凭据，无默认密钥 | `.env` 修改后重启 |
+| `VOICE_WAKE_WORD` | 默认“你好小博” | 首次初始值；UI 保存值优先 |
+| `VOICE_WAKE_HOTKEY` | 默认 `Ctrl + \` | 首次初始值；UI 保存值优先 |
+| `VOICE_IDLE_TIMEOUT_SECONDS` | 默认正整数 60 秒 | 首次初始值；UI 保存值优先 |
 
 首次启动时，尚未在设置页保存的交互项从 `.env` 读取，未配置时采用默认值：
 
@@ -52,11 +98,11 @@ VOICE_IDLE_TIMEOUT_SECONDS=60
 
 文字接管会结束旧 ASR 连接，清理未提交的语音聚合和判意候选，再按原生顺序打断、提交旧回复及追加文字。已经显示的语音片段沿原有展示历史保存，已提交模型历史保留；旧连接及旧队列的转写继续携带原输入归属，后到的结果被排除。原生 worker、音频设备和 AEC 继续存续。
 
-接管时用户还在说话，会沿用 VAD 等待该段发言结束，再接收后续新发言。新 ASR 连接在后台准备，文字回复可先开始；属于新输入的音频在连接准备期间仅作短时内存缓冲。普通接管不重复播放唤醒叮声。识别连接准备、旧发言尾段和回复处理期间暂停空闲计时，全部完成后重新等待。语音正在启动或结束的短暂切换期间，文字发送暂不可用。数据源、接入位置与验证结果见[跨输入接管记录](verification/stage-08.md)。
+接管时用户还在说话，会沿用 VAD 等待该段发言结束，再接收后续新发言。新 ASR 连接在后台准备，文字回复可先开始；属于新输入的音频在连接准备期间仅作短时内存缓冲。普通接管不重复播放唤醒叮声。识别连接准备、旧发言尾段和回复处理期间暂停空闲计时，全部完成后重新等待。语音正在启动或结束的短暂切换期间，文字发送暂不可用。数据源和接入位置见[跨输入接管计划及记录](plan/V1.0.0/08-input-takeover.md)。
 
 待唤醒时检测到 Windows 默认录音或播放端点变化，会关闭旧流、刷新 PortAudio 枚举并重建 AEC/KWS 音频入口；原生 worker、上下文和正在进行的文字回复保留。活动语音中旧设备仍可用时继续使用，返回待唤醒后切换，唤醒前也会检查当前默认设备。端点或音频流失效后停止语音并显示原因；点击主窗口、可见悬浮卡片或托盘的“恢复语音”打开当前默认设备，成功后回到待唤醒，由用户再次唤醒。恢复时若正在生成文字，会立即打断并提交已有片段，等待旧对象释放后重建语音；此前的问题和回答继续保留，恢复成功后等待新输入。恢复使用本次启动的有效配置，修改 `.env` 后仍需重启应用。
 
-后台快照提供独立的 `microphone_level` 和 `playback_level`（0～1），分别来自 AEC 后的收音和到达 DAC 时刻的播放数据，按最多 20 Hz 推送。收音球外环始终使用收音音量；中央在聆听时使用收音、实际播报时使用播放音量，准备、识别、判意、生成及读取时显示缓慢音柱。音频格式、参考时序及实机验收安排见[音频设备验证记录](verification/stage-07.md)，悬浮交互规则见[悬浮 UI 设计](design/V1.0.0-ui.md)。
+后台快照提供独立的 `microphone_level` 和 `playback_level`（0～1），分别来自 AEC 后的收音和到达 DAC 时刻的播放数据，按最多 20 Hz 推送。收音球外环始终使用收音音量；中央在聆听时使用收音、实际播报时使用播放音量，准备、识别、判意、生成及读取时显示缓慢音柱。音频格式、参考时序及实机验收安排见[音频设备计划及记录](plan/V1.0.0/07-audio-aec-devices.md)，悬浮交互规则见[悬浮 UI 设计](design/V1.0.0-ui.md)。
 
 ## 3 加载前端构建产物
 
@@ -83,7 +129,7 @@ uv run --locked voice-super-agent
 
 输入区下方显示“正在保存…”或“已保存在本机”。保存失败时显示具体原因，并暂停接收新消息；退出时保存失败会保留并显示主窗口，状态区域提供“再次退出”。处理磁盘、权限等原因后，再次退出会重新尝试最终保存，成功后退出。读取数据库失败时同样显示原因并暂停新消息，原数据库保留。
 
-主窗口使用暖白布局，左侧进入对话、历史记录与设置；顶部显示语音和处理状态，并提供“重新开始”。“结束语音”在准备或交互期间出现，语音失败时由提示区提供“恢复语音”。设置页可查看当前生效的唤醒词、组合键、超时和服务/设备信息，也可点击“隐藏到托盘”或“退出应用”。历史页从最近记录开始，每页按需加载 20 条，通过保存位置游标继续加载较早内容。点击一条记录查看完整原文，较长正文每次展开最多 8000 个 Unicode 字符，可继续读取至结束。浏览不切换当前工作窗口，返回对话后继续原交流。设置、历史页面与生效规则见[验证记录](verification/stage-14.md)。
+主窗口使用暖白布局，左侧进入对话、历史记录与设置；顶部显示语音和处理状态，并提供“重新开始”。“结束语音”在准备或交互期间出现，语音失败时由提示区提供“恢复语音”。设置页可查看当前生效的唤醒词、组合键、超时和服务/设备信息，也可点击“隐藏到托盘”或“退出应用”。历史页从最近记录开始，每页按需加载 20 条，通过保存位置游标继续加载较早内容。点击一条记录查看完整原文，较长正文每次展开最多 8000 个 Unicode 字符，可继续读取至结束。浏览不切换当前工作窗口，返回对话后继续原交流。设置、历史页面与生效规则见[计划及执行记录](plan/V1.0.0/14-settings-history-ui.md)。
 
 聊天支持 Enter 发送、Shift + Enter 换行，中文输入法组词时的回车由输入法处理。输入框随内容增高；向上滚动阅读时暂停跟随新回复，点击“回到最新”恢复。切换导航、隐藏和恢复窗口保留未发送草稿。主界面呈现、操作和 Windows 200% 缩放验证见[主界面记录](verification/stage-12.md)。
 
@@ -135,11 +181,15 @@ uv run --locked voice-super-agent --desktop-check
 | `.env` | 本地服务凭据 | 忽略；提交配置示例 |
 | `.local/data/agent.sqlite3` | 展示历史、原生模型消息与当前工作范围 | 忽略 |
 | `.local/logs/app.log` | 启动、订阅、窗口操作和退出日志 | 忽略 |
+| `.local/logs/setup.log` | 双击准备的各步骤输出与错误 | 忽略 |
+| `.local/logs/desktop.log` | 无终端桌面入口的输出、依赖和启动错误 | 忽略 |
 | `.local/webview/` | WebView2 本地存储 | 忽略 |
 | `resources/models/` | 本地 KWS 模型与下载包 | 忽略；资源说明纳入仓库 |
 | `uv.lock`、`frontend/package-lock.json` | 依赖解析结果 | 提交 |
 
 当前开发数据位置位于各自工作副本内，换一个副本会创建自己的 `.local`。
+
+同一个 Windows 登录会话中保持一个应用实例。切换工作副本前先从托盘明确退出旧实例；旧实例仍运行时，任何副本的重复启动都会唤出该实例，其数据仍属于原工作副本。
 
 首次打开数据库时应用自动执行已确认版本的初始化脚本 `src/voice_super_agent/memory/migrations/V1.0.0_001__init_conversation.sql`，无需手工执行 SQL。数据库工作由单独的串行 I/O 线程处理，流式片段按短批次合并；用户提交、原生上下文提交和正常退出会触发及时保存。结构、保存时机与恢复规则见 [架构说明](design/V1.0.0-architecture.md#71-sqlite-保存)。
 
@@ -163,15 +213,12 @@ uv run --locked python -c "import sys; import voice_super_agent; print(sys.execu
 ```
 
 - 缺少前端产物：执行构建命令后重试。
+- 双击提示缺少 Git/uv/Node/npm：按第 1 节安装开发工具，并重新打开终端确认命令可用。
+- 准备失败：查看 `.local/logs/setup.log` 的失败步骤；检查网络、磁盘空间、目录权限和下载源，再次双击重试。首次下载依赖较多，已有项目文件不需要手工删除。
+- 桌面未打开：查看 `.local/logs/desktop.log`；若是缺失 WebView2，安装 Runtime 后重新启动。也可用终端启动命令直接观察错误。
 - `--dev` 连接失败：先启动 Vite，检查终端输出与 5178 端口。
 - 桌面引擎启动失败：核对 WebView2 Runtime、.NET 和终端异常；已启用的文件日志位于 `.local/logs/app.log`。
 - 页面一直连接中：检查是否在 pywebview 桌面内打开；普通浏览器不提供 Python 桥接。查看桌面终端和日志中的页面订阅结果。
 - 对话保存异常：查看界面与日志中的具体原因，检查数据库所在目录及磁盘状态；处理后再次点击“退出应用”保存并退出。
 
-本文件描述开发工作副本的运行方式，安装分发与完整资源准备随后续阶段补齐。
-
-环境准备见 [阶段 01 验证记录](verification/stage-01.md)，常驻、桥接和悬浮宿主的实机结果见 [阶段 02 验证记录](verification/stage-02.md)。
-
-文字消息、原生上下文提交、流式服务测试与真实模型验收见 [阶段 03 验证记录](verification/stage-03.md)。
-
-SQLite 事务、正常重启、未完成回复、保存失败保留窗口及真实模型跨进程接续见 [阶段 04 验证记录](verification/stage-04.md)。
+本文件描述 Windows 开发工作副本的准备与启动，当前版本为 `1.0.0.dev0`。语音真实设备验收未完成，完整 V1.0.0 仍以[验收清单](verification/stage-15-acceptance.md)为准。依赖与迁入代码说明见[来源记录](code-sources.md)，新副本及双击启动结果见[交付记录](verification/stage-16.md)。
