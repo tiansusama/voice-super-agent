@@ -26,6 +26,8 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   const canSend = state.model_available && canOperate && !voiceSwitching;
   const failedReplies = new Set(snapshot.messages.filter(message => message.role === 'assistant' && message.status === 'failed')
     .map(message => message.id));
+  const latestRequest = new Map(snapshot.messages.filter(message => message.role === 'user')
+    .map(message => [message.retry_origin_message_id ?? message.id, message.id]));
   const voiceLabel = { off: '语音未启动', standby: '语音待唤醒', starting: '正在准备语音', active: '语音交互中',
     stopping: '正在结束语音', error: '语音不可用' }[state.voice_status];
   const activityLabel = { listening: '正在聆听', recognizing: '正在识别', classifying: '正在判断接管',
@@ -218,7 +220,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
                     {message.role === 'user' ? '正在识别…' : '正在回复…'}</span>}
                   {message.error && <p className="message-error" role="alert">{message.error}</p>}
                 </div>
-                {snapshot.task_cards?.filter(task => task.source.message_id === message.id).map(task =>
+                {snapshot.task_cards?.filter(task => latestRequest.get(task.source.message_id) === message.id).map(task =>
                   <TaskCard key={task.id} task={task} open={openTask} command={taskCommand} />)}
                 {message.role === 'user' && message.source === 'text' && failedReplies.has(message.reply_id) &&
                   <button className="resend-message" disabled={!canSend || sending} onClick={() => void sendText(message.id)}>

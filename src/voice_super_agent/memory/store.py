@@ -34,6 +34,9 @@ class ConversationStore:
         if version < 4:
             script = Path(__file__).with_name("migrations") / "V1.0.1_004__tasks.sql"
             self._connection.executescript(script.read_text(encoding="utf-8"))
+        if version < 5:
+            script = Path(__file__).with_name("migrations") / "V1.0.1_005__message_retry_origin.sql"
+            self._connection.executescript(script.read_text(encoding="utf-8"))
         messages = [dict(row) for row in self._connection.execute("SELECT * FROM display_messages ORDER BY position")]
         records = [
             {"display_message_id": row["display_message_id"], "message": json.loads(row["message_json"])}
@@ -42,6 +45,8 @@ class ConversationStore:
         window = dict(self._connection.execute("SELECT * FROM working_window WHERE id = 1").fetchone())
         for message in messages:
             del message["position"]
+            if message["retry_origin_message_id"] is None:
+                del message["retry_origin_message_id"]
         del window["id"]
         return {"messages": messages, "model_records": records, "window": window}
 
@@ -58,10 +63,13 @@ class ConversationStore:
         # 上下文引用的展示消息先写入；任一语句失败时，整轮关联更新回滚。
         with self._connection:
             self._connection.executemany(
-                """INSERT INTO display_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO display_messages
+                   (position, id, role, source, reply_id, text, status, created_at, error, retry_origin_message_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET text=excluded.text, status=excluded.status, error=excluded.error""",
                 [(position, message["id"], message["role"], message["source"], message["reply_id"],
-                  message["text"], message["status"], message["created_at"], message["error"])
+                  message["text"], message["status"], message["created_at"], message["error"],
+                  message.get("retry_origin_message_id"))
                  for position, message in enumerate(messages)],
             )
             self._connection.executemany(
