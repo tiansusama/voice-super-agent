@@ -55,11 +55,13 @@ _COMMANDS = {
     "task_command": (
         "用户明确要求补充、回答、暂停、继续、取消或重试某个任务时调用。"
         "先确定 task_id，回答还须确定 question_id。新的操作范围仅来自用户当轮明确授权。"
+        "如果问题要求核对旧步骤，只有用户明确确认已完成、未执行或已停止时才提供 resolution。"
         "普通聊天、打断回复、结束语音和重新开始对话本身都无需此工具。",
         {
             "task_id": _TEXT,
             "action": {"enum": ["supplement", "answer", "pause", "resume", "cancel", "retry"]},
             "text": _TEXT, "question_id": _TEXT, "scope": _SCOPE,
+            "resolution": {"enum": ["succeeded", "not_executed", "cancelled"]},
         },
         ["task_id", "action"],
     ),

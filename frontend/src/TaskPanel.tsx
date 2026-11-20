@@ -12,7 +12,15 @@ const taskActions = {
   pause: '暂停', resume: '继续', cancel: '取消', retry: '重试',
 };
 
+const stepResolutionLabels = {
+  succeeded: '已完成', not_executed: '未执行', cancelled: '已停止',
+};
+const stepStatus = {
+  ...stepResolutionLabels, started: '执行中', uncertain: '等待核对', failed: '失败',
+};
+
 type TaskControl = keyof typeof taskActions;
+type StepResolution = keyof typeof stepResolutionLabels;
 
 export type TaskSummary = {
   id: string;
@@ -33,6 +41,7 @@ type TaskQuestion = {
   text: string;
   status: 'open' | 'answered' | 'closed';
   answer: string | null;
+  step_id?: string | null;
 };
 
 export type TaskNotice = {
@@ -46,12 +55,18 @@ export type TaskDetail = {
   task: TaskSummary;
   questions: TaskQuestion[];
   artifacts: { kind: string; path: string }[];
+  steps?: {
+    id: string;
+    status: keyof typeof stepStatus;
+    request: { tool: string; target: string; arguments: Record<string, unknown> };
+    outcome: { result: Record<string, unknown>; error: string } | null;
+  }[];
 };
 
 export type RunTaskAction = (
   taskId: string,
   action: TaskControl | 'answer',
-  payload?: { question_id: string; text: string },
+  payload?: { question_id: string; text: string; resolution?: StepResolution },
 ) => Promise<unknown>;
 
 export function TaskCard({ task, open, command }: {
@@ -93,6 +108,7 @@ export function TaskCard({ task, open, command }: {
 
 export function QuestionReply({ question, command }: { question: TaskQuestion; command: RunTaskAction }) {
   const [text, setText] = useState('');
+  const [resolution, setResolution] = useState<StepResolution | ''>('');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
 
@@ -100,8 +116,11 @@ export function QuestionReply({ question, command }: { question: TaskQuestion; c
     setPending(true);
     setError('');
     try {
-      await command(question.task_id, 'answer', { question_id: question.id, text: text.trim() });
+      await command(question.task_id, 'answer', resolution
+        ? { question_id: question.id, text: stepResolutionLabels[resolution], resolution }
+        : { question_id: question.id, text: text.trim() });
       setText('');
+      setResolution('');
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -111,9 +130,15 @@ export function QuestionReply({ question, command }: { question: TaskQuestion; c
 
   return <form className="task-answer" onSubmit={event => { event.preventDefault(); void answer(); }}>
     <label htmlFor={`question-${question.id}`}>{question.text}</label>
-    <textarea id={`question-${question.id}`} value={text} onChange={event => setText(event.target.value)}
-      disabled={pending} rows={2} required />
-    <button type="submit" className="quiet-button" disabled={pending || !text.trim()}>{pending ? '正在提交…' : '提交答复'}</button>
+    {question.step_id ? <select id={`question-${question.id}`} value={resolution}
+      onChange={event => setResolution(event.target.value as StepResolution | '')} disabled={pending} required>
+      <option value="">选择实际结果</option>
+      {Object.entries(stepResolutionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+    </select> : <textarea id={`question-${question.id}`} value={text} onChange={event => setText(event.target.value)}
+      disabled={pending} rows={2} required />}
+    <button type="submit" className="quiet-button" disabled={pending || !(question.step_id ? resolution : text.trim())}>
+      {pending ? '正在提交…' : '提交答复'}
+    </button>
     {error && <p className="message-error" role="alert">{error}</p>}
   </form>;
 }
@@ -179,6 +204,16 @@ export function TaskPanel({ selected, revision, open, close, command }: {
           <h3>产物</h3>
           <ul>{currentDetail.artifacts.map(artifact => <li key={artifact.path}>{artifact.path}</li>)}</ul>
         </section>}
+        {currentDetail.steps && currentDetail.steps.length > 0 &&
+          <details className="task-steps"><summary>执行记录（{currentDetail.steps.length}）</summary>
+            {currentDetail.steps.map(step => <details key={step.id}>
+              <summary>{step.request.tool} · {stepStatus[step.status]}</summary>
+              <p>{step.request.target}</p>
+              <pre>{JSON.stringify(step.request.arguments, null, 2)}</pre>
+              {step.outcome?.error && <p className="message-error">{step.outcome.error}</p>}
+              {step.outcome && <pre>{JSON.stringify(step.outcome.result, null, 2)}</pre>}
+            </details>)}
+          </details>}
       </div>}
     </> : <>
       {tasks.map(task => <TaskCard key={task.id} task={task} open={open} command={command} />)}

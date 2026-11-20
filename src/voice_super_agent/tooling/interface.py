@@ -4,7 +4,7 @@ from pathlib import Path
 
 from mcp.server import Server
 
-from voice_super_agent.tasks.interface import ActionRequest, ExecutionAccess, Operation, ScopeGrant
+from voice_super_agent.tasks.interface import ActionRequest, ActionResult, ExecutionAccess, Operation, ScopeGrant
 from voice_super_agent.tooling.apps import Application, ApplicationTools, AppPlatform
 from voice_super_agent.tooling.files import FileGrant, FileOperation, FileTools
 from voice_super_agent.tooling.server import create_builtin_tool_server
@@ -76,3 +76,30 @@ class BuiltinTools:
         application = Application(target, "exe" if Path(target).is_absolute() else "apps", target)
         window = await asyncio.to_thread(self._applications.find_window, application)
         return {"target": target, "window": window}
+
+    async def reconcile_action(self, _execution: ExecutionAccess, step: dict) -> ActionResult:
+        request = step["request"]
+        operation = request["operation"]
+        try:
+            evidence = await self.inspect_action(request)
+        except (OSError, RuntimeError) as exc:
+            return ActionResult(status="uncertain", result={}, artifacts=[], error=f"核对实际状态失败：{exc}")
+
+        error = ""
+        if operation in {"directory.list", "file.read"}:
+            status = "not_executed"
+            error = "上次查询读取得不到已保存的结果，可以重新读取当前内容。"
+        elif operation == "file.create":
+            if evidence["exists"]:
+                status, error = "uncertain", "目标文件已存在，无法确认产物归属，请确认已有文件。"
+            else:
+                status, error = "not_executed", "目标文件当前不存在，可以重新生成。"
+        elif operation in WINDOW_OPERATIONS:
+            status = "succeeded" if evidence["visible"] == request["expected"]["visible"] else "not_executed"
+            evidence["recovered_from"] = "current_visibility"
+        elif evidence["window"] is not None:
+            status = "succeeded"
+            evidence["outcome"] = "window_observed_on_recovery"
+        else:
+            status, error = "uncertain", "核对时未找到应用窗口，无法确认上次启动的结果。"
+        return ActionResult(status=status, result=evidence, artifacts=[], error=error)

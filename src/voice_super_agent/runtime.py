@@ -354,7 +354,7 @@ class Runtime:
             )} for plan in arguments["plans"]]
         else:
             payload = TaskCommandPayload(source=source)
-            for field in ("text", "question_id"):
+            for field in ("text", "question_id", "resolution"):
                 if field in arguments:
                     payload[field] = arguments[field]
             if "scope" in arguments:
