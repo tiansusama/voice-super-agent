@@ -36,6 +36,11 @@ for (const restartFails of [false, true]) {
         list_history: async () => { throw new Error('本用例不浏览历史'); },
         read_history: async () => { throw new Error('本用例不读取原文'); },
         floating_layout: async () => { throw new Error('主窗口不报告悬浮布局'); },
+        list_tasks: async () => { throw new Error('本用例不查询任务'); },
+        get_task: async () => { throw new Error('本用例不查询任务详情'); },
+        task_command: async () => { throw new Error('本用例不操作任务'); },
+        save_task_concurrency: async () => { throw new Error('本用例不修改任务并发'); },
+        mark_task_read: async () => { throw new Error('本用例不修改任务通知'); },
       } };
     }, restartFails);
     await page.goto('/');

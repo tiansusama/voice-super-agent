@@ -166,14 +166,14 @@ export function TaskPanel({ selected, revision, open, close, command }: {
     async function read() {
       const api = window.pywebview!.api;
       if (selected) {
-        const result = await api.get_task!(selected);
+        const result = await api.get_task(selected);
         if (active) setDetail(result);
         return;
       }
       let cursor: number | null = null;
       const rows: TaskSummary[] = [];
       for (let index = 0; index < pages; index++) {
-        const result = await api.list_tasks!(cursor ?? undefined);
+        const result = await api.list_tasks(cursor ?? undefined);
         rows.push(...result.tasks);
         cursor = result.next_cursor;
         if (cursor === null || !active) break;

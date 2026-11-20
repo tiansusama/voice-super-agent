@@ -106,11 +106,11 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   }
 
   const taskCommand: RunTaskAction = (taskId, action, payload) =>
-    window.pywebview!.api.task_command!(taskId, action, payload);
+    window.pywebview!.api.task_command(taskId, action, payload);
 
   async function openTaskNotice(notice: TaskNotice) {
     try {
-      if (!notice.read) await window.pywebview!.api.mark_task_read!(notice.id);
+      if (!notice.read) await window.pywebview!.api.mark_task_read(notice.id);
       setError('');
       openTask(notice.task_id);
     } catch (reason) {
@@ -258,7 +258,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
           open={openTask} close={() => setSelectedTask(null)} command={taskCommand} />}
         {page === 'settings' && <SettingsPanel state={state} command={command}>
           {state.task_concurrency != null && <TaskConcurrencySetting limit={state.task_concurrency}
-            save={limit => window.pywebview!.api.save_task_concurrency!(limit)} disabled={!canOperate} />}
+            save={limit => window.pywebview!.api.save_task_concurrency(limit)} disabled={!canOperate} />}
         </SettingsPanel>}
 
         {state.desktop_check && <section className="desktop-check"><details><summary>桌面联调 · 后台计数 {state.activity_tick} · 状态序号 {snapshot.sequence}</summary>
