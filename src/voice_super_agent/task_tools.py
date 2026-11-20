@@ -12,6 +12,20 @@ from voice_super_agent.tooling.files import FileGrant, FileTools
 
 _TEXT = {"type": "string", "minLength": 1}
 _IDS = {"type": "array", "items": _TEXT}
+_ACTION_WORDS = {
+    "application.open": ("启动", "运行", "打开", "launch", "run", "open"),
+    "window.show": ("显示", "恢复", "打开", "show", "restore", "open"),
+    "window.hide": ("隐藏", "关闭", "收起", "hide", "close"),
+    "directory.list": ("列出", "查看", "查询", "浏览", "枚举", "list"),
+    "file.read": ("读取", "读出", "查看", "读", "read"),
+    "file.create": ("生成", "新建", "创建", "写入", "写到", "保存到", "输出到", "整理成", "create", "write", "save"),
+}
+_ACTIONS = re.compile("|".join(re.escape(word) for word in
+                               sorted({word for words in _ACTION_WORDS.values() for word in words}, key=len, reverse=True)),
+                      re.IGNORECASE)
+_CLAUSE = re.compile(r"[，。！？；,!;?\n\r]")
+_NEGATED = re.compile(r"不要|别|不必|不需要|不允许|不是|禁止|无需|不能|不应|\b(?:not|never|don't)\b", re.IGNORECASE)
+_QUOTED = re.compile(r'「([^」]+)」|“([^”]+)”|"([^"]+)"|\x60([^\x60]+)\x60')
 _SCOPE = {
     "type": "array", "minItems": 1,
     "items": {
@@ -86,10 +100,8 @@ def confirmed_scope(grants: list[ScopeGrant], user_text: str, resolve_applicatio
     scopes = []
     for grant in grants:
         operation, target = grant["operation"], grant["target"].strip()
-        # 防止从历史、文件或略长的路径中截出当前用户未给出的目标。
-        if not target or not re.search(rf"(?<![a-z0-9_./\\:+-]){re.escape(target)}(?![a-z0-9_./\\:+-])",
-                                      user_text, re.IGNORECASE):
-            raise ValueError(f"该目标需要用户在当前消息中明确给出：{target}")
+        if not target or not _explicit_operation(user_text, operation, target):
+            raise ValueError(f"请在当前消息中明确确认此操作和完整目标：{operation} {target}")
         if operation in FILE_OPERATIONS:
             action = FILE_OPERATIONS[operation]
             target = str(FileTools([FileGrant(action, target)]).approved_path(action, target))
@@ -101,3 +113,30 @@ def confirmed_scope(grants: list[ScopeGrant], user_text: str, resolve_applicatio
             target = resolve_application(target)
         scopes.append(ScopeGrant(operation=operation, target=target))
     return scopes
+
+
+def _explicit_operation(user_text: str, operation: Operation, target: str) -> bool:
+    quotes = list(_QUOTED.finditer(user_text))
+    for match in re.finditer(rf"(?<![a-z0-9_./\\:+-]){re.escape(target)}(?![a-z0-9_./\\:+-])",
+                             user_text, re.IGNORECASE):
+        start, end = match.span()
+        enclosing = next((quote for quote in quotes if quote.start() < start and end < quote.end()), None)
+        if enclosing is not None:
+            if enclosing[0][1:-1].casefold() != target.casefold():
+                continue
+            start, end = enclosing.span()
+        elif operation in FILE_OPERATIONS and (
+                re.search(r"\s", target) or re.match(r"[ \t]+[^\s，。！？；,;!?]+\.[^\s，。！？；,;!?]+", user_text[end:])):
+            continue
+        before = _CLAUSE.split(user_text[:start])[-1]
+        after = _CLAUSE.split(user_text[end:], maxsplit=1)[0]
+        preceding = list(_ACTIONS.finditer(before))
+        if preceding:
+            phrase = preceding[-1]
+            if phrase[0].casefold() in _ACTION_WORDS[operation] and not _NEGATED.search(before):
+                return True
+        else:
+            phrase = _ACTIONS.search(after)
+            if phrase is not None and phrase[0].casefold() in _ACTION_WORDS[operation] and not _NEGATED.search(before + after):
+                return True
+    return False

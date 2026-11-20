@@ -253,16 +253,26 @@ async def voice(tmp_path, monkeypatch, request):
     if mode == "tasks":
         class TestTasks(TaskStore):
             async def start(self):
-                pass
+                self.changes = asyncio.Queue()
 
             async def close(self):
                 pass
+
+            async def next_change(self):
+                return await self.changes.get()
+
+            async def dispatch(self, source, plans):
+                cursor = await self.last_change_position()
+                result = await super().dispatch(source, plans)
+                for change in await self.list_changes(cursor):
+                    self.changes.put_nowait(change)
+                return result
 
             async def save_result(self, task_id, result):
                 detail = await self.get_task(task_id)
                 detail["task"].update(state="completed", result=result, progress="", actions=[])
                 for change in await self.save_task(detail, [{"kind": "result", "text": result}]):
-                    await self.notify(change)
+                    self.changes.put_nowait(change)
 
             async def save_question(self, task_id, text):
                 detail = await self.get_task(task_id)
@@ -272,11 +282,10 @@ async def voice(tmp_path, monkeypatch, request):
                 detail["task"].update(state="waiting_user", actions=["answer"])
                 for change in await self.save_task(detail, [{"kind": "question", "text": text,
                                                            "question_id": question["id"]}]):
-                    await self.notify(change)
+                    self.changes.put_nowait(change)
 
-        def task_factory(store, notify):
+        def task_factory(store):
             tasks = TestTasks(store)
-            tasks.notify = notify
             harness.tasks = tasks
             return tasks
     harness.detector = SimpleNamespace(reset=lambda: None, feed=lambda audio, rate: False)

@@ -8,7 +8,10 @@ import pytest
 from voice_super_agent.desktop.host import DesktopApi
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.runtime import Runtime
+from voice_super_agent.tasks.mcp_client import MCPExecutionClient
+from voice_super_agent.tasks.runtime import TaskRuntime
 from voice_super_agent.tasks.store import TaskStore
+from voice_super_agent.tooling.interface import BuiltinTools
 
 
 def test_desktop_task_operations_share_the_runtime_state():
@@ -34,6 +37,9 @@ def test_desktop_task_operations_share_the_runtime_state():
         async def list_changes(self, after_position, limit):
             return []
 
+        async def next_change(self):
+            await asyncio.Future()
+
         async def get_task(self, task_id):
             return {"task": {"id": task_id, "state": self.state}}
 
@@ -43,7 +49,7 @@ def test_desktop_task_operations_share_the_runtime_state():
             return {"id": task_id, "state": self.state, "source": {"message_id": "message"}}
 
     tasks = TaskService()
-    runtime = Runtime(task_factory=lambda store, notify: tasks)
+    runtime = Runtime(task_factory=lambda store: tasks)
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
@@ -68,6 +74,9 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
 
         async def close(self):
             pass
+
+        async def next_change(self):
+            await asyncio.Future()
 
     path = tmp_path / "tasks.sqlite3"
 
@@ -94,7 +103,7 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
 
     notification = asyncio.run(seed())
     for reopened in (False, True):
-        runtime = Runtime(database_path=path, task_factory=lambda store, notify: TaskService(store))
+        runtime = Runtime(database_path=path, task_factory=TaskService)
         runtime.start()
         try:
             api = DesktopApi(runtime, "main")
@@ -124,6 +133,9 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
         async def list_changes(self, after_position, limit):
             return []
 
+        async def next_change(self):
+            await asyncio.Future()
+
         async def request_shutdown(self):
             ready = action_finished.is_set()
             return {"requested": True, "ready": ready, "error": "",
@@ -132,7 +144,7 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
         async def withdraw_shutdown(self):
             return {"requested": False, "ready": False, "waiting": [], "error": ""}
 
-    runtime = Runtime(task_factory=lambda store, notify: TaskService())
+    runtime = Runtime(task_factory=lambda store: TaskService())
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
@@ -153,15 +165,16 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
 
 @pytest.mark.asyncio
 async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monkeypatch):
-    class TaskService(TaskStore):
-        async def start(self):
-            pass
-
-        async def close(self):
-            pass
-
     target = str(tmp_path / "报告.txt")
     tool_results = asyncio.Queue()
+    tools = BuiltinTools(applications=None)
+
+    async def worker(execution):
+        detail = await execution.get_task()
+        async with MCPExecutionClient(tools.create_server(execution, detail["scope"])) as session:
+            result = await session.call_tool("create_text_file", {"path": target, "content": "测试产物"})
+        assert result["structuredContent"]["path"] == target
+        await execution.complete("报告已生成")
 
     async def complete(request):
         body = await request.json()
@@ -194,7 +207,7 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     await site.start()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "task-test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{server.addresses[0][1]}")
-    runtime = Runtime(task_factory=lambda store, notify: TaskService(store))
+    runtime = Runtime(task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
     runtime.start()
     try:
         accepted = runtime.send_text(f"请生成文件「{target}」")
@@ -207,15 +220,22 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
                 await asyncio.sleep(.01)
         assert runtime.connect("main")["task_cards"][0]["id"] == task["id"]
         async with asyncio.timeout(5):
-            while runtime.connect("main")["messages"][-1]["status"] != "failed":
+            while not any(message["id"] == accepted["reply_id"] and message["status"] == "failed"
+                          for message in runtime.connect("main")["messages"]):
                 await asyncio.sleep(.01)
         assert runtime.resend_text(accepted["user_message_id"])["existing_task_ids"] == [task["id"]]
-        assert len(runtime.connect("main")["messages"]) == 2
+        assert sum(message["role"] == "user" for message in runtime.connect("main")["messages"]) == 1
+        async with asyncio.timeout(5):
+            while not any(message.get("task_notice") for message in runtime.connect("main")["messages"]):
+                await asyncio.sleep(.01)
+        assert (tmp_path / "报告.txt").read_text(encoding="utf-8") == "测试产物"
 
-        runtime.send_text("请告诉我还有哪些任务？")
-        denied = await asyncio.wait_for(tool_results.get(), 5)
-        assert denied["status"] == "rejected"
-        assert "当前消息" in denied["message"]
+        for instruction in ("请告诉我还有哪些任务？", f"请读取「{target}」", f"不要生成「{target}」",
+                            f"请生成「{target} 备份.txt」"):
+            runtime.send_text(instruction)
+            denied = await asyncio.wait_for(tool_results.get(), 5)
+            assert denied["status"] == "rejected"
+            assert "当前消息" in denied["message"]
         assert [record["id"] for record in runtime.list_tasks()["tasks"]] == [task["id"]]
     finally:
         await asyncio.to_thread(runtime.stop)

@@ -38,8 +38,9 @@ class BuiltinTools:
 
     def create_server(self, access: ExecutionAccess, scope: Sequence[ScopeGrant]) -> Server:
         files = FileTools(
-            FileGrant(FILE_OPERATIONS[grant["operation"]], grant["target"])
-            for grant in scope if grant["operation"] in FILE_OPERATIONS
+            (FileGrant(FILE_OPERATIONS[grant["operation"]], grant["target"])
+             for grant in scope if grant["operation"] in FILE_OPERATIONS),
+            canonical=True,
         )
         windows = None
         if self._set_window_visibility is not None:

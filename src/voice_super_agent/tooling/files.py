@@ -49,9 +49,9 @@ def _check_page(offset: int, limit: int, maximum: int) -> None:
 class FileTools:
     """文件工具只使用已确认的操作类型和路径。"""
 
-    def __init__(self, grants: Iterable[FileGrant]):
+    def __init__(self, grants: Iterable[FileGrant], *, canonical: bool = False):
         self._grants = frozenset(
-            (grant.operation, _resolve(grant.path, grant.operation)) for grant in grants
+            (grant.operation, Path(grant.path) if canonical else _resolve(grant.path, grant.operation)) for grant in grants
         )
 
     def approved_path(self, operation: FileOperation, path: str) -> Path:
