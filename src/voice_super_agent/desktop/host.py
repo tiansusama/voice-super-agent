@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from concurrent.futures import Future
 import ctypes
 from ctypes import wintypes
 import json
@@ -82,6 +83,7 @@ class Desktop:
     def __init__(self, runtime: Runtime, page: str):
         self.runtime = runtime
         self._quitting = False
+        self._main_ready: Future[None] = Future()
         self._floating_layout = (False, True, 0, False, False, False)
         self._floating_target = self._floating_layout
         self.main = webview.create_window(
@@ -97,18 +99,24 @@ class Desktop:
             shadow=False, background_color="#FBFAF7",
         )
         self.main.events.before_show += self._initialize_main
+        self.main.events.shown += self._signal_main_ready
         self.floating.events.before_show += self._initialize_floating
         self.main.events.before_load += lambda: runtime.disconnect("main")
         self.floating.events.before_load += lambda: runtime.disconnect("floating")
         self._worker = Thread(target=self._pump, name="desktop-events")
 
     def stop(self) -> None:
+        if not self._main_ready.done():
+            self._main_ready.set_exception(RuntimeError("主窗口已关闭。"))
         if self._worker.ident is not None:
             self.runtime.events.put(None)
             self._worker.join()
 
     def activate(self) -> None:
         self.runtime.command("show_main")
+
+    def _signal_main_ready(self) -> None:
+        self._main_ready.set_result(None)
 
     def _initialize_main(self, window) -> None:
         from System.Windows.Forms import ContextMenuStrip, NotifyIcon, ToolStripMenuItem
@@ -240,9 +248,11 @@ class Desktop:
         self.main.native.BeginInvoke(Action(action))
 
     async def get_main_visibility(self) -> bool:
+        await asyncio.shield(asyncio.wrap_future(self._main_ready))
         return await asyncio.to_thread(self._run_main_on_gui, self._main_is_visible)
 
     async def set_main_visibility(self, visible: bool) -> bool:
+        await asyncio.shield(asyncio.wrap_future(self._main_ready))
         return await asyncio.to_thread(self._run_main_on_gui, lambda: self._set_main_visibility(visible))
 
     def _run_main_on_gui(self, operation) -> bool:
