@@ -26,6 +26,19 @@ _ACTIONS = re.compile("|".join(re.escape(word) for word in
 _CLAUSE = re.compile(r"[，。！？；,!;?\n\r]")
 _NEGATED = re.compile(r"不要|别|不必|不需要|不允许|不是|禁止|无需|不能|不应|\b(?:not|never|don't)\b", re.IGNORECASE)
 _QUOTED = re.compile(r'「([^」]+)」|“([^”]+)”|"([^"]+)"|\x60([^\x60]+)\x60')
+_TASK_VERBS = {
+    "pause": ("暂停", "暂时停止"),
+    "cancel": ("取消", "停止", "终止"),
+    "resume": ("继续", "恢复"),
+    "retry": ("重试",),
+    "answer": ("回答", "答复", "回复"),
+    "supplement": ("补充",),
+}
+_USER_RESOLUTIONS = {
+    "succeeded": ("已完成", "已经完成", "完成了"),
+    "not_executed": ("未执行", "未开始", "没有执行"),
+    "cancelled": ("已停止", "已取消", "已经停止"),
+}
 _SCOPE = {
     "type": "array", "minItems": 1,
     "items": {
@@ -69,6 +82,7 @@ _COMMANDS = {
     "task_command": (
         "用户明确要求补充、回答、暂停、继续、取消或重试某个任务时调用。"
         "先确定 task_id，回答还须确定 question_id。新的操作范围仅来自用户当轮明确授权。"
+        "聊天中的任务指令需明确动作及任务名称，如「暂停某任务」或「回答某任务：答复内容」。"
         "如果问题要求核对旧步骤，只有用户明确确认已完成、未执行或已停止时才提供 resolution。"
         "普通聊天、打断回复、结束语音和重新开始对话本身都无需此工具。",
         {
@@ -94,6 +108,29 @@ def validate_task_arguments(name: str, arguments: dict) -> None:
                              "additionalProperties": False})
     except ValidationError as exc:
         raise ValueError(f"任务参数无效：{exc.json_path} {exc.message}") from exc
+
+
+def task_command_intent(action: str, user_text: str, task: dict) -> tuple[bool, str]:
+    """从用户原话提取已明确的任务目标和答复，模型参数仅负责定位候选。"""
+    instruction = user_text.strip().rstrip("。！!").strip()
+    verb = "(?:" + "|".join(_TASK_VERBS[action]) + ")"
+    prefix = r"(?:(?:请|麻烦|帮我|先|把|将)\s*)*"
+    for is_id, name in ((True, task["id"]), (False, task["title"])):
+        literal = re.escape(name)
+        target = rf'(?:「{literal}」|“{literal}”|"{literal}"|{literal})'
+        action_target = rf"(?:{verb}\s*(?:任务\s*)?{target}(?:\s*任务)?|{target}(?:\s*任务)?\s*{verb})"
+        if action in {"answer", "supplement"}:
+            match = re.fullmatch(rf"{prefix}{action_target}\s*[:：]\s*(?P<text>\S[\s\S]*)", instruction, re.IGNORECASE)
+            if match is not None:
+                return is_id, match["text"]
+        elif re.fullmatch(rf"{prefix}{action_target}", instruction, re.IGNORECASE):
+            return is_id, ""
+    raise ValueError("请明确说明要操作的任务名称及动作。答复可说「回答任务名称：答复内容」，也可在任务详情直接提交。")
+
+
+def confirm_step_resolution(user_answer: str, resolution: str | None) -> None:
+    if resolution is None or user_answer.rstrip("。！!").strip() not in _USER_RESOLUTIONS[resolution]:
+        raise ValueError("请明确确认实际步骤已完成、未执行或已停止。")
 
 
 def confirmed_scope(grants: list[ScopeGrant], user_text: str, resolve_application: Callable[[str], str]) -> list[ScopeGrant]:

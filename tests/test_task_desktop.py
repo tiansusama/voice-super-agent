@@ -331,3 +331,73 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     finally:
         await asyncio.to_thread(runtime.stop)
         await server.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_model_cannot_pause_a_task_without_the_users_explicit_target(monkeypatch):
+    commands = []
+    results = asyncio.Queue()
+    task = {"id": "report", "title": "生成报告", "state": "running", "actions": ["pause"],
+            "source": {"message_id": "earlier"}}
+
+    class TaskService:
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def get_concurrency(self):
+            return 2
+
+        async def list_changes(self, after_position, limit):
+            return []
+
+        async def list_tasks(self, cursor=None, limit=20):
+            return {"tasks": [task], "next_cursor": None}
+
+        async def get_task(self, task_id):
+            assert task_id == task["id"]
+            return {"task": task, "questions": []}
+
+        async def task_command(self, task_id, action, payload):
+            commands.append((task_id, action))
+            return {**task, "state": "paused"}
+
+    async def model(request):
+        body = await request.json()
+        latest = body["messages"][-1]
+        if latest["role"] == "tool":
+            results.put_nowait(json.loads(latest["content"]))
+            delta, finish = {"content": "收到。"}, "stop"
+        else:
+            delta, finish = {"tool_calls": [{"index": 0, "id": f"control-{len(body['messages'])}",
+                                             "type": "function", "function": {"name": "task_command",
+                                             "arguments": '{"task_id":"report","action":"pause"}'}}]}, "tool_calls"
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        chunk = {"id": "model", "object": "chat.completion.chunk", "created": 0, "model": "test",
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        await response.write(f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+        return response
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", model)
+    server = web.AppRunner(app)
+    await server.setup()
+    await web.TCPSite(server, "127.0.0.1", 0).start()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "task-test-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{server.addresses[0][1]}")
+    runtime = Runtime(task_factory=lambda store, on_change: TaskService())
+    runtime.start()
+    try:
+        for instruction in ("只停止当前播报，后台任务继续。", "暂停任务", "先不要暂停生成报告"):
+            runtime.send_text(instruction)
+            assert (await asyncio.wait_for(results.get(), 5))["status"] == "rejected"
+        assert commands == []
+        runtime.send_text("请暂停「生成报告」。")
+        assert (await asyncio.wait_for(results.get(), 5))["task"]["state"] == "paused"
+        assert commands == [("report", "pause")]
+    finally:
+        await asyncio.to_thread(runtime.stop)
+        await server.cleanup()

@@ -15,7 +15,7 @@ from websockets.exceptions import WebSocketException
 
 from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
-from voice_super_agent.task_tools import confirmed_scope, validate_task_arguments
+from voice_super_agent.task_tools import confirm_step_resolution, confirmed_scope, task_command_intent, validate_task_arguments
 from voice_super_agent.tasks.interface import (
     ShutdownProgress, TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail,
     TaskPage, TaskRuntimeFault, TaskService, TaskSource, TaskSummary,
@@ -376,10 +376,32 @@ class Runtime:
                 confirmed_scope, plan["scope"], user_text, resolve_application,
             )} for plan in arguments["plans"]]
         else:
+            action = arguments["action"]
+            detail = await tasks.get_task(arguments["task_id"])
+            by_id, user_answer = task_command_intent(action, user_text, detail["task"])
+            if not by_id:
+                cursor = None
+                while True:
+                    page = await tasks.list_tasks(cursor, 100)
+                    if any(candidate["title"].casefold() == detail["task"]["title"].casefold()
+                           and candidate["id"] != detail["task"]["id"] and action in candidate["actions"]
+                           for candidate in page["tasks"]):
+                        raise ValueError("存在同名任务，请提供任务 ID 或通过任务详情操作。")
+                    cursor = page["next_cursor"]
+                    if cursor is None:
+                        break
             payload = TaskCommandPayload(source=source)
-            for field in ("text", "question_id", "resolution"):
-                if field in arguments:
-                    payload[field] = arguments[field]
+            if user_answer:
+                payload["text"] = user_answer
+            if action == "answer":
+                open_questions = [question for question in detail["questions"] if question["status"] == "open"]
+                if len(open_questions) != 1 or open_questions[0]["id"] != arguments.get("question_id"):
+                    raise ValueError("请在任务详情中选择具体问题并提交答复。")
+                question = open_questions[0]
+                payload["question_id"] = question["id"]
+                if question["step_id"] is not None:
+                    confirm_step_resolution(user_answer, arguments.get("resolution"))
+                    payload["resolution"] = arguments["resolution"]
             if "scope" in arguments:
                 payload["scope"] = await asyncio.to_thread(
                     confirmed_scope, arguments["scope"], user_text, resolve_application,
