@@ -23,6 +23,7 @@ from voice_super_agent.runtime import Runtime
 from voice_super_agent import runtime as runtime_module
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.audio.devices import AudioDevices, Endpoint
+from voice_super_agent.tasks.store import TaskStore
 from voice_super_agent.voice import pipeline as voice_pipeline
 from voice_super_agent.voice import volcengine
 
@@ -246,12 +247,33 @@ async def voice(tmp_path, monkeypatch, request):
     for key in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY"):
         monkeypatch.setenv(key, "test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", url)
-    standby = getattr(request, "param", False)
+    mode = getattr(request, "param", False)
+    standby = mode is True or mode == "tasks"
+    task_factory = None
+    if mode == "tasks":
+        class TestTasks(TaskStore):
+            async def start(self):
+                pass
+
+            async def close(self):
+                pass
+
+            async def save_result(self, task_id, result):
+                detail = await self.get_task(task_id)
+                detail["task"].update(state="completed", result=result, progress="", actions=[])
+                for change in await self.save_task(detail, [{"kind": "result", "text": result}]):
+                    await self.notify(change)
+
+        def task_factory(store, notify):
+            tasks = TestTasks(store)
+            tasks.notify = notify
+            harness.tasks = tasks
+            return tasks
     harness.detector = SimpleNamespace(reset=lambda: None, feed=lambda audio, rate: False)
     monkeypatch.setattr(runtime_module, "KeywordDetector", lambda directory, word: harness.detector)
     monkeypatch.setattr(HoldHotkey, "pressed", lambda self: False)
     harness.runtime = Runtime(desktop_check=True, database_path=tmp_path / "voice.sqlite3",
-                              wake_model_dir=tmp_path if standby else None)
+                              wake_model_dir=tmp_path if standby else None, task_factory=task_factory)
     harness.runtime.start()
     if not standby:
         harness.runtime.command("start_voice")
@@ -270,6 +292,44 @@ async def voice(tmp_path, monkeypatch, request):
         await asyncio.to_thread(harness.runtime.stop)
         await server.cleanup()
         logger.enable("pipecat")
+
+
+@pytest.mark.parametrize("voice", ["tasks"], indirect=True)
+@pytest.mark.asyncio
+async def test_saved_voice_task_results_play_when_idle_and_stay_unread_in_standby(voice):
+    voice.tools["显示小博主窗口。"] = ("dispatch_tasks", {"plans": [{
+        "key": "show", "title": "显示主窗口", "goal": "显示小博",
+        "scope": [{"operation": "window.show", "target": "小博主窗口"}],
+    }]})
+    await voice.wake()
+    voice.release_audio()
+    await voice.transcript("显示小博主窗口。")
+    snapshot = await voice.wait(lambda s: s["task_cards"] and s["state"]["voice_playing"])
+    task = snapshot["task_cards"][0]
+    assert task["source"]["source"] == "voice"
+    await voice.backend(voice.tasks.save_result(task["id"], "窗口显示完成"))
+
+    heard = await voice.wait(lambda s: any(message.get("task_notice", {}).get("read")
+                                           for message in s["messages"]))
+    assert any("窗口显示完成" in request["req_params"]["text"] for request in voice.tts_requests)
+    assert len([message for message in heard["messages"] if message.get("task_notice")]) == 1
+    voice.runtime.command("end_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    await voice.backend(voice.tasks.save_result(task["id"], "待唤醒时完成"))
+    await voice.wait(lambda s: any("待唤醒时完成" in message["text"] and not message["task_notice"]["read"]
+                                   for message in s["messages"]))
+    await voice.wake()
+    await asyncio.sleep(0.22)
+    assert not any("待唤醒时完成" in request["req_params"]["text"] for request in voice.tts_requests)
+    await voice.backend(voice.tasks.save_result(task["id"], "播报中途接管"))
+    await voice.wait(lambda s: s["state"]["voice_playing"]
+                     and any("播报中途接管" in request["req_params"]["text"] for request in voice.tts_requests))
+    accepted = voice.runtime.send_text("切回文字")
+    voice.release_audio()
+    interrupted = await voice.wait(lambda s: any(message["id"] == accepted["reply_id"] and message["status"] == "completed"
+                                                for message in s["messages"]))
+    assert not next(message["task_notice"]["read"] for message in interrupted["messages"]
+                    if "播报中途接管" in message["text"])
 
 
 @pytest.mark.asyncio

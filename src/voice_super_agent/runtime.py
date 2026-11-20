@@ -77,6 +77,10 @@ class Runtime:
         self._task_cards: dict[str, TaskSummary] = {}
         self._task_notices: dict[str, TaskChange] = {}
         self._task_questions: dict[str, dict] = {}
+        self._task_speech_queue: list[TaskChange] = []
+        self._task_speech_activations: dict[str, int] = {}
+        self._task_speaking: str | None = None
+        self._voice_activation = 0
         self._storage_ready = False
         self._revision = 0
         self._saved_revision = 0
@@ -206,6 +210,12 @@ class Runtime:
         self._loop.call_soon_threadsafe(self._update, changes)
 
     def _update(self, changes: dict[str, Any]) -> None:
+        if self._state["voice_status"] == "active" and changes.get("voice_status", "active") != "active":
+            self._voice_activation += 1
+            self._task_speech_queue.clear()
+            self._task_speech_activations.clear()
+            self._task_speaking = None
+            self._lifecycle.activity("task_feedback", False, self._loop.time())
         self._state.update(changes)
         state = self._state
         current_error = state["last_error"] and state["last_error"]["reply_id"] == state["floating_reply_id"]
@@ -236,6 +246,9 @@ class Runtime:
                                                       if task["source"]["message_id"] in visible]}
 
     async def _task_changed(self, change: TaskChange) -> None:
+        if (self._state["voice_status"] == "active" and change["source"] == "voice" and not change["read"]
+                and change["kind"] in {"question", "result"}):
+            self._task_speech_activations[change["id"]] = self._voice_activation
         self._task_changes.set()
 
     async def _watch_task_changes(self) -> None:
@@ -253,6 +266,7 @@ class Runtime:
                 self._task_cards[task_id] = detail["task"]
                 self._task_questions.update((question["id"], question) for question in detail["questions"])
             for change in batch:
+                activation = self._task_speech_activations.pop(change["id"], None)
                 if change["kind"] in {"question", "result", "error"}:
                     message_id = f'task-{change["id"]}'
                     self._task_notices[message_id] = change
@@ -264,6 +278,8 @@ class Runtime:
                             "created_at": change["created_at"], "error": "",
                         }
                         self._request_save(immediate=True)
+                        if activation == self._voice_activation and not change["read"]:
+                            self._task_speech_queue.append(change)
                 self._task_position = change["position"]
                 projected = True
         if projected:
@@ -722,7 +738,39 @@ class Runtime:
         while True:
             if self._lifecycle.should_end(self._loop.time()) and self._state["voice_status"] == "active":
                 await self._command("end_voice")
+            elif self._task_speech_queue and self._task_voice_ready():
+                await self._speak_task_feedback()
             await asyncio.sleep(0.05)
+
+    def _task_voice_ready(self) -> bool:
+        return (self._state["voice_status"] == "active" and not self._lifecycle.busy
+                and self._state["active_reply_id"] is None and not self._state["exiting"]
+                and not self._state["restarting"] and self._lifecycle.ending_reply is None)
+
+    async def _speak_task_feedback(self) -> None:
+        activation = self._voice_activation
+        if not await asyncio.shield(self._flush()) or activation != self._voice_activation or not self._task_voice_ready():
+            return
+        if not self._task_speech_queue:
+            return
+        index = next((i for i, change in enumerate(self._task_speech_queue) if change["kind"] == "question"), 0)
+        notice = self._task_speech_queue.pop(index)
+        message_id = f'task-{notice["id"]}'
+        if (self._task_notices[message_id]["read"] or notice["kind"] == "question"
+                and self._task_questions[notice["question_id"]]["status"] != "open"):
+            return
+        task = self._task_cards[notice["task_id"]]
+        self._task_speaking = notice["id"]
+        self._lifecycle.activity("task_feedback", True, self._loop.time())
+        if not await self._conversation.speak_task_feedback(notice["id"], f'{task["title"]}。{notice["text"][:180]}'):
+            self._task_speaking = None
+            self._lifecycle.activity("task_feedback", False, self._loop.time())
+
+    async def _record_heard_task(self, notification_id: str) -> None:
+        try:
+            await self._mark_task_read(notification_id)
+        except (sqlite3.Error, OSError) as exc:
+            logger.error("保存任务通知已播报状态失败：%s", exc)
 
     async def _use_default_audio(self):
         transport = self._conversation._voice.transport
@@ -773,6 +821,13 @@ class Runtime:
                                   "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
 
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "task_feedback_finished":
+            if event["notification_id"] == self._task_speaking:
+                self._task_speaking = None
+                self._lifecycle.activity("task_feedback", False, self._loop.time())
+                if event["played"]:
+                    asyncio.create_task(self._record_heard_task(event["notification_id"]), name="task-notice-heard")
+            return
         if event["type"] == "history":
             self._update({"history_status": "reading" if event["active"] else event["status"],
                           "history_reply_id": event["reply_id"], "history_error": event["error"]})
