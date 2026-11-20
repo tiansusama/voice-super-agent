@@ -191,7 +191,8 @@ async def test_waiting_answer_requeues_under_capacity_and_keeps_pause_intent(own
 
 
 @pytest.mark.asyncio
-async def test_reboot_reconciles_uncertain_step_without_replay_and_preserves_cancel(owner):
+@pytest.mark.parametrize("inspection_error", [False, True])
+async def test_reboot_reconciles_uncertain_step_without_replay_and_preserves_cancel(owner, inspection_error):
     store = TaskStore(owner)
     task_id = (await store.dispatch(SOURCE, [plan("cancelled"), plan("independent")]))["tasks"][0]["id"]
     detail = await store.get_task(task_id)
@@ -205,12 +206,27 @@ async def test_reboot_reconciles_uncertain_step_without_replay_and_preserves_can
         ran.append(execution.task_id)
         await execution.complete("独立任务已完成")
 
-    runtime = TaskRuntime(owner, worker, uncertain)
+    async def reconcile(execution, step):
+        if inspection_error:
+            raise OSError("目标暂时不可查询")
+        return await uncertain(execution, step)
+
+    runtime = TaskRuntime(owner, worker, reconcile)
     await runtime.start()
     try:
         detail = await state(runtime, task_id, "waiting_user")
         assert detail["task"]["stop_intent"] == "cancel"
         assert runtime._resources
+        if inspection_error:
+            count = len(detail["executions"])
+            await runtime.task_command(task_id, "cancel")
+            async with asyncio.timeout(2):
+                while True:
+                    updated = await runtime.get_task(task_id)
+                    if updated["task"]["state"] == "waiting_user" and len(updated["executions"]) > count:
+                        break
+                    await asyncio.sleep(0.005)
+            assert len(updated["questions"]) == 1
         await runtime.task_command(task_id, "answer", {"question_id": detail["questions"][0]["id"],
                                                         "text": "已经显示", "resolution": "succeeded"})
         assert (await runtime.get_task(task_id))["task"]["state"] == "cancelled"
@@ -286,6 +302,8 @@ async def test_successful_action_write_failure_retains_fact_and_retry_does_not_r
             while runtime._running:
                 await asyncio.sleep(0.005)
         fail = False
+        with pytest.raises(RuntimeError, match="尚未保存"):
+            await runtime.close()
         assert not (await runtime.request_shutdown())["ready"]
         assert (await runtime.get_task(task_id))["steps"][0]["outcome"] == outcome()
         await runtime.withdraw_shutdown()

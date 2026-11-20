@@ -36,6 +36,7 @@ class TaskRuntime:
         self._resources: dict[str, str] = {}
         self._running: dict[str, _Execution] = {}
         self._faults: dict[str, TaskDetail] = {}
+        self._events = asyncio.Queue()
         self._shutdown = False
         self._shutdown_error = ""
         self._dispatcher: asyncio.Task | None = None
@@ -108,6 +109,9 @@ class TaskRuntime:
     async def list_changes(self, after_position=0, limit=50):
         return await self._store.list_changes(after_position, limit)
 
+    async def next_change(self):
+        return await self._events.get()
+
     async def mark_read(self, notification_id):
         await self._store.mark_read(notification_id)
 
@@ -123,6 +127,8 @@ class TaskRuntime:
     async def _publish(self, change):
         if self._on_change is not None:
             await self._on_change(change)
+        else:
+            self._events.put_nowait(change)
 
     def _actions(self, detail):
         task = detail["task"]
@@ -297,8 +303,13 @@ class TaskRuntime:
                 async with self._lock:
                     detail = await self.get_task(execution.task_id)
                     if detail["task"]["state"] == "running":
-                        detail["task"].update(state="failed", error=str(exc), progress="执行失败")
-                        await self._commit(detail, [{"kind": "error", "text": str(exc)}])
+                        detail["task"]["error"] = str(exc)
+                        pending = next((step for step in detail["steps"] if step["status"] in {"started", "uncertain"}), None)
+                        if pending is not None:
+                            await self._question(detail, execution.execution_id, f"核对执行失败：{exc}。请确认该步骤的实际结果。", pending["id"])
+                        else:
+                            detail["task"].update(state="failed", progress="执行失败")
+                            await self._commit(detail, [{"kind": "error", "text": str(exc)}])
         finally:
             async with self._lock:
                 try:
@@ -415,10 +426,7 @@ class TaskRuntime:
                 if artifact not in detail["artifacts"]:
                     detail["artifacts"].append(artifact)
             if outcome["status"] == "uncertain":
-                if not any(q["step_id"] == step_id and q["status"] == "open" for q in detail["questions"]):
-                    await self._question(detail, execution.execution_id, "无法确定上次动作结果，请确认该步骤已完成、未执行或已停止。", step_id)
-                else:
-                    await self._commit(detail, [])
+                await self._question(detail, execution.execution_id, "无法确定上次动作结果，请确认该步骤已完成、未执行或已停止。", step_id)
             else:
                 await self._commit(detail, [{"kind": "state", "text": f"工具实际结果：{outcome['status']}", "step_id": step_id}])
                 self._release_resources(step)
@@ -429,6 +437,10 @@ class TaskRuntime:
                     self._stop_execution(execution)
 
     async def _question(self, detail, execution_id, text, step_id=None):
+        if step_id is not None and any(q["step_id"] == step_id and q["status"] == "open" for q in detail["questions"]):
+            detail["task"].update(state="waiting_user", progress="等待用户答复")
+            await self._commit(detail, [{"kind": "state", "text": "等待用户答复"}])
+            return
         question = {"id": uuid4().hex, "task_id": detail["task"]["id"], "execution_id": execution_id,
                     "step_id": step_id, "text": text, "status": "open", "answer": None,
                     "created_at": datetime.now(timezone.utc).isoformat()}
@@ -517,6 +529,8 @@ class TaskRuntime:
         await self.request_shutdown()
         while self._running:
             await asyncio.gather(*(execution.task for execution in list(self._running.values())), return_exceptions=False)
+        if not self._shutdown_progress()["ready"]:
+            raise RuntimeError("任务事实尚未保存，请解决保存错误后重试退出。")
         if self._dispatcher is not None:
             self._dispatcher.cancel()
             with suppress(asyncio.CancelledError):
