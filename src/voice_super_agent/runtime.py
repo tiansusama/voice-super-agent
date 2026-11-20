@@ -245,7 +245,7 @@ class Runtime:
 
     def _snapshot(self) -> dict[str, Any]:
         messages = [dict(message) for message in self._messages.values()][self._window["display_start_position"]:]
-        visible = {message["id"] for message in messages}
+        visible = {message.get("retry_origin_message_id", message["id"]) for message in messages}
         for message in messages:
             notice = self._task_notices.get(message["id"])
             if notice is not None:
@@ -385,6 +385,10 @@ class Runtime:
         # 完成输入保存后再检查接管状态，已经提交的任务由任务运行时持续执行。
         self._task_source(reply_id)
         if name == "dispatch_tasks":
+            origin_id = self._messages[source["message_id"]].get("retry_origin_message_id")
+            if origin_id is not None:
+                origin = self._messages[origin_id]
+                source = TaskSource(message_id=origin_id, reply_id=origin["reply_id"], source=origin["source"])
             return await asyncio.shield(tasks.dispatch(source, plans))
         result = await asyncio.shield(self._task_command(arguments["task_id"], arguments["action"], payload))
         return {"task": result}
@@ -511,17 +515,18 @@ class Runtime:
         if (message["role"] != "user" or message["source"] != "text"
                 or self._messages[message["reply_id"]]["status"] != "failed"):
             raise ValueError("只能重新发送回答失败的文字消息。")
+        origin_id = message.get("retry_origin_message_id", user_message_id)
         if self._tasks is not None:
-            batch = await self._tasks.find_batch(user_message_id)
+            batch = await self._tasks.find_batch(origin_id)
             if batch is not None:
                 self._task_cards.update((task["id"], task) for task in batch["tasks"])
                 self._update({"task_revision": self._state["task_revision"] + 1})
                 return {"user_message_id": user_message_id, "reply_id": message["reply_id"],
                         "existing_task_ids": [task["id"] for task in batch["tasks"]]}
         # 从后台原消息读取正文，沿普通发送路径追加新输入并执行接管。
-        return await self._send_text(message["text"])
+        return await self._send_text(message["text"], retry_origin_message_id=origin_id)
 
-    async def _send_text(self, text: str) -> dict[str, str]:
+    async def _send_text(self, text: str, *, retry_origin_message_id: str | None = None) -> dict[str, str]:
         text = text.strip()
         if not text:
             raise ValueError("请输入消息内容。")
@@ -548,6 +553,8 @@ class Runtime:
             "id": user_id, "role": "user", "source": "text", "reply_id": reply_id,
             "text": text, "status": "completed", "created_at": timestamp, "error": "",
         }
+        if retry_origin_message_id is not None:
+            self._messages[user_id]["retry_origin_message_id"] = retry_origin_message_id
         self._messages[reply_id] = {
             "id": reply_id, "role": "assistant", "source": "text", "reply_id": reply_id,
             "text": "", "status": "queued", "created_at": timestamp, "error": "",

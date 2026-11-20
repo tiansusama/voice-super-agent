@@ -224,10 +224,12 @@ def test_task_projection_reports_transient_read_failure_and_keeps_processing():
 
 
 @pytest.mark.asyncio
-async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dispatch_on_retry", [False, True])
+async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monkeypatch, dispatch_on_retry):
     target = str(tmp_path / "报告.txt")
     tool_results = asyncio.Queue()
     tools = BuiltinTools(applications=None)
+    fail_before_dispatch = dispatch_on_retry
 
     async def worker(execution):
         detail = await execution.get_task()
@@ -237,6 +239,7 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
         await execution.complete("报告已生成")
 
     async def complete(request):
+        nonlocal fail_before_dispatch
         body = await request.json()
         message = body["messages"][-1]
         if message["role"] == "tool":
@@ -246,6 +249,9 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
                 return web.json_response({"error": {"message": "任务已保存，但聊天回复失败"}}, status=503)
             delta, finish = {"content": "已收到。"}, "stop"
         else:
+            if fail_before_dispatch:
+                fail_before_dispatch = False
+                return web.json_response({"error": {"message": "尚未创建任务"}}, status=503)
             assert any(tool["function"]["name"] == "dispatch_tasks" for tool in body["tools"])
             plans = [{"key": "report", "title": "生成报告", "goal": "生成报告",
                       "scope": [{"operation": "file.create", "target": target}]}]
@@ -267,10 +273,26 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     await site.start()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "task-test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{server.addresses[0][1]}")
-    runtime = Runtime(task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
+    def new_runtime():
+        return Runtime(database_path=tmp_path / "desktop.sqlite3",
+                       task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
+
+    async def wait_for_failed_reply(reply_id):
+        async with asyncio.timeout(5):
+            while not any(message["id"] == reply_id and message["status"] == "failed"
+                          for message in runtime.connect("main")["messages"]):
+                await asyncio.sleep(.01)
+
+    runtime = new_runtime()
     runtime.start()
     try:
         accepted = runtime.send_text(f"请生成文件「{target}」")
+        issued = accepted
+        if dispatch_on_retry:
+            await wait_for_failed_reply(accepted["reply_id"])
+            assert runtime.list_tasks()["tasks"] == []
+            issued = runtime.resend_text(accepted["user_message_id"])
+            assert issued["user_message_id"] != accepted["user_message_id"]
         result = await asyncio.wait_for(tool_results.get(), 5)
         task, = runtime.list_tasks()["tasks"]
         assert result["tasks"][0]["id"] == task["id"]
@@ -279,16 +301,17 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
             while not runtime.connect("main")["task_cards"]:
                 await asyncio.sleep(.01)
         assert runtime.connect("main")["task_cards"][0]["id"] == task["id"]
-        async with asyncio.timeout(5):
-            while not any(message["id"] == accepted["reply_id"] and message["status"] == "failed"
-                          for message in runtime.connect("main")["messages"]):
-                await asyncio.sleep(.01)
-        assert runtime.resend_text(accepted["user_message_id"])["existing_task_ids"] == [task["id"]]
-        assert sum(message["role"] == "user" for message in runtime.connect("main")["messages"]) == 1
+        await wait_for_failed_reply(issued["reply_id"])
         async with asyncio.timeout(5):
             while not any(message.get("task_notice") for message in runtime.connect("main")["messages"]):
                 await asyncio.sleep(.01)
         assert (tmp_path / "报告.txt").read_text(encoding="utf-8") == "测试产物"
+        await asyncio.to_thread(runtime.stop)
+        runtime = new_runtime()
+        runtime.start()
+        assert runtime.resend_text(accepted["user_message_id"])["existing_task_ids"] == [task["id"]]
+        assert runtime.resend_text(issued["user_message_id"])["existing_task_ids"] == [task["id"]]
+        assert sum(message["role"] == "user" for message in runtime.connect("main")["messages"]) == (2 if dispatch_on_retry else 1)
 
         for instruction in ("请告诉我还有哪些任务？", f"请读取「{target}」", f"不要生成「{target}」",
                             f"请生成「{target} 备份.txt」"):

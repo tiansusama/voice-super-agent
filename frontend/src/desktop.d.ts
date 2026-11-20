@@ -65,6 +65,7 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   source: 'text' | 'voice';
   reply_id: string;
+  retry_origin_message_id?: string;
   text: string;
   status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed' | 'unfinished' | 'backchannel';
   created_at: string;

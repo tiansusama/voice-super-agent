@@ -52,7 +52,7 @@ async def test_task_migration_preserves_version_three_conversation_and_settings(
         assert await owner.load_settings() == {"wake_word": "你好小博"}
         assert await TaskStore(owner).get_concurrency() == 2
         with sqlite3.connect(path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         await owner.close()
 
