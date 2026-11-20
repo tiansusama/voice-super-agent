@@ -53,6 +53,10 @@ class MCPExecutionClient:
         response = await self._session.list_tools()
         return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in response.tools]
 
+    @property
+    def next_request_id(self):
+        return self._session._request_id
+
     async def call_tool(self, name: str, arguments: dict) -> dict:
         response = await self._session.call_tool(name, arguments)
         if response.isError:

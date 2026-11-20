@@ -16,7 +16,7 @@ SOURCE = {"message_id": "request-0", "reply_id": "reply-0", "source": "text"}
 
 def plan(key, **values):
     return {"key": key, "title": key, "goal": "按已确认范围完成任务", "scope": [
-        {"operation": "file.read", "target": "E:\\任务资料", "recursive": True}], **values}
+        {"operation": "file.read", "target": "E:\\任务资料"}], **values}
 
 
 @pytest_asyncio.fixture
