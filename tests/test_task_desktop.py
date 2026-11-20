@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from threading import Event
 
 from aiohttp import web
@@ -141,6 +142,10 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
             return {"requested": True, "ready": ready, "error": "",
                     "waiting": [] if ready else [{"task_id": "task", "step_id": "step", "title": "生成清单"}]}
 
+        async def get_task(self, task_id):
+            assert task_id == "task"
+            return {"task": {"title": "生成清单"}, "steps": [{"id": "step", "request": {"tool": "create_text_file"}}]}
+
         async def withdraw_shutdown(self):
             return {"requested": False, "ready": False, "waiting": [], "error": ""}
 
@@ -151,7 +156,9 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
         api.command("quit")
         while (event := runtime.events.get(timeout=3)).get("command") != "show_main":
             assert event.get("command") != "quit_ready"
-        assert api.connect()["state"]["task_shutdown"]["waiting"][0]["step_id"] == "step"
+        assert api.connect()["state"]["task_shutdown"]["waiting"][0] == {
+            "task_id": "task", "step_id": "step", "title": "生成清单", "tool": "create_text_file",
+        }
         api.command("withdraw_task_exit")
         assert not api.connect()["state"]["task_shutdown"]["requested"]
         action_finished.set()
@@ -159,6 +166,50 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn():
         while runtime.events.get(timeout=3).get("command") != "quit_ready":
             pass
         assert api.connect()["state"]["exiting"]
+    finally:
+        runtime.stop()
+
+
+def test_task_projection_reports_transient_read_failure_and_keeps_processing():
+    class TaskService:
+        async def start(self):
+            self.events = asyncio.Queue()
+            self.unreadable = True
+
+        async def close(self):
+            pass
+
+        async def get_concurrency(self):
+            return 2
+
+        async def list_changes(self, after_position, limit):
+            return []
+
+        async def next_change(self):
+            return await self.events.get()
+
+        async def get_task(self, task_id):
+            if self.unreadable:
+                self.unreadable = False
+                raise sqlite3.OperationalError("测试读取暂不可用")
+            return {"task": {"id": task_id, "title": "生成清单", "source": {"message_id": "message"}}, "questions": []}
+
+    tasks = TaskService()
+    runtime = Runtime(task_factory=lambda store: tasks)
+    runtime.start()
+    try:
+        runtime._loop.call_soon_threadsafe(tasks.events.put_nowait, {
+            "id": "result", "position": 1, "task_id": "task", "source": "text", "kind": "result",
+            "read": False, "question_id": None, "step_id": None, "text": "产物已保存",
+            "created_at": "2026-11-20T03:00:00+00:00",
+        })
+        while not (snapshot := runtime.events.get(timeout=3)["snapshot"])["state"]["task_error"]:
+            pass
+        assert "测试读取暂不可用" in snapshot["state"]["task_error"]
+        while not (snapshot := runtime.events.get(timeout=3)["snapshot"])["messages"]:
+            pass
+        assert snapshot["messages"][0]["text"] == "生成清单 · 产物已保存"
+        assert snapshot["state"]["task_error"] == ""
     finally:
         runtime.stop()
 

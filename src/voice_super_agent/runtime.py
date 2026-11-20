@@ -134,6 +134,7 @@ class Runtime:
             "task_revision": 0,
             "task_concurrency": None,
             "task_shutdown": None,
+            "task_error": "",
         }
 
     def start(self) -> None:
@@ -180,11 +181,22 @@ class Runtime:
         if unfinished:
             self._request_save(immediate=True)
         if self._task_factory is not None:
-            self._tasks = self._task_factory(self._store)
-            await self._tasks.start()
-            await self._project_task_changes()
-            self._task_projection = asyncio.create_task(self._watch_task_changes(), name="task-notifications")
-            self._update({"task_concurrency": await self._tasks.get_concurrency()})
+            try:
+                self._tasks = self._task_factory(self._store)
+                await self._tasks.start()
+                await self._project_task_changes()
+                limit = await self._tasks.get_concurrency()
+            except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+                self._update({"task_error": f"后台任务启动失败：{exc}"})
+                if self._tasks is not None:
+                    tasks, self._tasks = self._tasks, None
+                    try:
+                        await tasks.close()
+                    except (sqlite3.Error, OSError, RuntimeError) as close_error:
+                        logger.error("关闭启动失败的任务运行时：%s", close_error)
+            else:
+                self._task_projection = asyncio.create_task(self._watch_task_changes(), name="task-notifications")
+                self._update({"task_concurrency": limit})
         logger.info("已恢复 %s 条展示消息、%s 条原生模型消息", len(self._messages), len(self._model_records))
         self._idle_task = asyncio.create_task(self._watch_idle(), name="voice-idle")
         if self._wake_model_dir is not None:
@@ -246,16 +258,24 @@ class Runtime:
         tasks = self._require_tasks()
         while True:
             change = await tasks.next_change()
-            if change["kind"] == "storage_error":
-                detail = await tasks.get_task(change["task_id"])
+            fault = change["kind"] == "storage_error"
+            if not fault and change["position"] <= self._task_position:
+                continue
+            activation = self._voice_activation if self._state["voice_status"] == "active" else None
+            while True:
+                try:
+                    detail = await tasks.get_task(change["task_id"])
+                    break
+                except (sqlite3.Error, OSError) as exc:
+                    error = f"读取任务更新失败：{exc}"
+                    if self._state["task_error"] != error:
+                        self._update({"task_error": error})
+                    await asyncio.sleep(0.5)
+            if fault:
                 self._task_cards[change["task_id"]] = detail["task"]
             else:
-                if change["position"] <= self._task_position:
-                    continue
-                activation = self._voice_activation if self._state["voice_status"] == "active" else None
-                detail = await tasks.get_task(change["task_id"])
                 self._project_task_change(change, detail, activation)
-            self._update({"task_revision": self._state["task_revision"] + 1})
+            self._update({"task_revision": self._state["task_revision"] + 1, "task_error": ""})
 
     async def _project_task_changes(self) -> None:
         tasks = self._require_tasks()
@@ -269,7 +289,7 @@ class Runtime:
         self._task_cards[task["id"]] = task
         self._task_questions.update((question["id"], question) for question in detail["questions"])
         self._task_position = change["position"]
-        if change["kind"] not in {"question", "result", "error"}:
+        if change["kind"] not in {"question", "result", "error", "supplement"}:
             return
         message_id = f'task-{change["id"]}'
         self._task_notices[message_id] = change
@@ -1034,6 +1054,13 @@ class Runtime:
             while True:
                 async with self._task_exit_lock:
                     progress = await tasks.request_shutdown()
+                    waiting = []
+                    for entry in progress["waiting"]:
+                        detail = await tasks.get_task(entry["task_id"])
+                        step = next((step for step in detail["steps"] if step["id"] == entry["step_id"]), None)
+                        waiting.append({**entry, "title": detail["task"]["title"],
+                                        "tool": step["request"]["tool"] if step is not None else ""})
+                    progress = {**progress, "waiting": waiting}
                     if progress != self._state["task_shutdown"]:
                         self._update({"task_shutdown": progress})
                     if progress["error"]:
@@ -1253,17 +1280,18 @@ class Runtime:
             if not await self._prepare_exit():
                 raise RuntimeError(self._state["storage_error"])
         finally:
-            if self._task_exit is not None and not self._task_exit.done():
-                self._task_exit.cancel()
-                with suppress(asyncio.CancelledError):
-                    await self._task_exit
-            if self._task_projection is not None:
-                self._task_projection.cancel()
-                with suppress(asyncio.CancelledError):
-                    await self._task_projection
-            if self._tasks is not None:
-                await self._tasks.close()
-            await self._store.close()
-            self._views.clear()
-            await self._loop.shutdown_asyncgens()
-            await self._loop.shutdown_default_executor()
+            try:
+                for task in (self._task_exit, self._task_projection):
+                    if task is not None:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+            finally:
+                try:
+                    if self._tasks is not None:
+                        await self._tasks.close()
+                finally:
+                    await self._store.close()
+                    self._views.clear()
+                    await self._loop.shutdown_asyncgens()
+                    await self._loop.shutdown_default_executor()
