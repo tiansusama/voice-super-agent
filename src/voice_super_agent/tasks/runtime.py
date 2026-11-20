@@ -58,8 +58,23 @@ class TaskRuntime:
                             self._resources[resource] = step["id"]
                 artifacts = [artifact for artifact in detail["artifacts"]
                              if artifact not in uncertain_artifacts or artifact in confirmed_artifacts]
-                artifacts_changed = artifacts != detail["artifacts"]
+                detail_changed = artifacts != detail["artifacts"]
                 detail["artifacts"] = artifacts
+                # 旧版撞名问题根据同次执行的文件步骤恢复新路径授权入口。
+                for question in detail["questions"]:
+                    if question["status"] != "open" or question["step_id"] is not None or "requested_operation" in question:
+                        continue
+                    for step in reversed(detail["steps"]):
+                        if (step["execution_id"] != question["execution_id"] or step["status"] != "not_executed"
+                                or step["request"]["operation"] != "file.create"):
+                            continue
+                        target = step["request"]["target"]
+                        error = f"目标已存在同名文件，请指定新文件名：{target}"
+                        if (step["outcome"]["error"] == error
+                                and question["text"] == f"文件生成尚未执行：{error}。请确认新的路径或内容。"):
+                            question.update(requested_operation="file.create", replacement_for=target)
+                            detail_changed = True
+                            break
                 if task["state"] in {"running", "pausing", "cancelling", "recovering", "storage_error"} or task["stop_reason"] == "shutdown":
                     for record in detail["executions"]:
                         if record["state"] == "running":
@@ -68,7 +83,7 @@ class TaskRuntime:
                     if task["stop_reason"] == "shutdown":
                         task["stop_reason"] = None
                     await self._commit(detail, [{"kind": "state", "text": task["progress"]}])
-                elif artifacts_changed:
+                elif detail_changed:
                     await self._commit(detail, [])
             self._dispatcher = asyncio.create_task(self._schedule(), name="task-dispatcher")
             self._wake.set()

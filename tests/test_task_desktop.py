@@ -406,7 +406,8 @@ def test_chat_replacement_path_keeps_user_punctuation(tmp_path):
     assert replacement_file_scope(answer)["target"] == path
 
 
-def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
+@pytest.mark.parametrize("saved_question", [False, True])
+def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path, saved_question):
     database, original, replacement = tmp_path / "task.sqlite3", tmp_path / "旧.txt", tmp_path / "新.txt"
     original.write_text("保留原文件", encoding="utf-8")
     tools = BuiltinTools(applications=None)
@@ -423,7 +424,25 @@ def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
             store = TaskStore(owner)
             result = await store.dispatch(source, [{"key": "report", "title": "生成报告", "goal": "创建文件",
                                                     "scope": [{"operation": "file.create", "target": str(original)}]}])
-            return result["tasks"][0]["id"]
+            task_id = result["tasks"][0]["id"]
+            if saved_question:
+                detail = await store.get_task(task_id)
+                error = f"目标已存在同名文件，请指定新文件名：{original}"
+                text = f"文件生成尚未执行：{error}。请确认新的路径或内容。"
+                detail["task"].update(state="waiting_user", progress="等待用户答复", execution_id="previous",
+                                      actions=["answer", "pause", "cancel", "supplement"])
+                detail["executions"].append({"id": "previous", "state": "waiting_user"})
+                detail["steps"].append({
+                    "id": "previous-step", "execution_id": "previous", "status": "not_executed",
+                    "request": {"operation": "file.create", "target": str(original), "resources": []},
+                    "outcome": {"status": "not_executed", "error": error, "artifacts": [], "result": {}},
+                })
+                detail["questions"].append({
+                    "id": "previous-question", "task_id": task_id, "execution_id": "previous", "step_id": None,
+                    "status": "open", "text": text, "answer": None, "created_at": "2026-11-20",
+                })
+                await store.save_task(detail, [{"kind": "question", "text": text, "question_id": "previous-question"}])
+            return task_id
         finally:
             await owner.close()
 
