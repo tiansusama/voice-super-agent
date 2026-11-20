@@ -494,13 +494,22 @@ async def test_existing_application_window_is_insufficient_recovery_evidence():
 
 
 @pytest.mark.asyncio
-async def test_empty_model_response_is_persisted_as_retryable_failure(owner):
-    responses = iter([{"role": "assistant"}, {"role": "assistant", "content": "重试完成"}])
+@pytest.mark.parametrize("choices", [[], [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant"}}]])
+async def test_empty_model_response_is_persisted_as_retryable_failure(owner, monkeypatch, choices):
+    responses = iter([choices, [{"index": 0, "finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "重试完成"}}]])
 
-    async def model(params):
-        return next(responses)
+    def respond(request):
+        return httpx.Response(200, json={"id": "reply", "created": 0, "model": "test",
+                                         "object": "chat.completion", "choices": next(responses)})
 
-    runtime = runtime_with(owner, model)
+    def client(**options):
+        return AsyncOpenAI(**options, http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+
+    monkeypatch.setattr("voice_super_agent.tasks.worker.AsyncOpenAI", client)
+    tools = BuiltinTools(None)
+    worker = TaskWorker(tools.create_server, api_key="test", base_url="http://model.test", model="test")
+    runtime = TaskRuntime(owner, worker, ActionReconciler(tools.inspect_action))
     await runtime.start()
     try:
         batch = await runtime.dispatch(SOURCE, [plan("空回复", [("window.show", "main")])])
