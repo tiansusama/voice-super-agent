@@ -30,8 +30,9 @@ async def _execute_action(
             try:
                 result = await perform()
             except (FileExistsError, ValueError) as exc:
+                evidence = {"reason": "file_exists"} if operation == "file.create" and isinstance(exc, FileExistsError) else {}
                 await access.finish_action(step_id, {
-                    "status": "not_executed", "result": {}, "artifacts": [], "error": str(exc),
+                    "status": "not_executed", "result": evidence, "artifacts": [], "error": str(exc),
                 })
                 raise
             except (OSError, RuntimeError) as exc:

@@ -21,6 +21,7 @@ from voice_super_agent.tasks.interface import (
     TaskPage, TaskRuntimeFault, TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
+from voice_super_agent.tooling.files import FileGrant, FileTools
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.wake import KeywordDetector
@@ -321,7 +322,36 @@ class Runtime:
         return asyncio.run_coroutine_threadsafe(self._require_tasks().get_task(task_id), self._loop).result()
 
     def task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None = None) -> TaskSummary:
-        return asyncio.run_coroutine_threadsafe(self._task_command(task_id, action, payload), self._loop).result()
+        return asyncio.run_coroutine_threadsafe(self._desktop_task_command(task_id, action, payload), self._loop).result()
+
+    async def _desktop_task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
+        answer = TaskCommandPayload()
+        for key in ("text", "question_id", "resolution"):
+            if payload and key in payload:
+                answer[key] = payload[key]
+        if action == "answer":
+            detail = await self._require_tasks().get_task(task_id)
+            question = next((question for question in detail["questions"]
+                             if question["id"] == answer.get("question_id") and question["status"] == "open"), None)
+            if question is None:
+                raise ValueError("答复必须对应此任务尚待回答的问题。")
+            if question.get("requested_operation") == "file.create":
+                new_path = answer["text"].strip()
+                target = str(await asyncio.to_thread(
+                    lambda: FileTools([FileGrant("create", new_path)]).approved_path("create", new_path),
+                ))
+                message_id = uuid4().hex
+                source = TaskSource(message_id=message_id, reply_id=message_id, source="text")
+                self._messages[message_id] = {
+                    "id": message_id, "reply_id": message_id, "role": "user", "source": "text",
+                    "text": f'为任务「{detail["task"]["title"]}」指定新文件「{new_path}」。',
+                    "status": "completed", "created_at": datetime.now(timezone.utc).isoformat(), "error": "",
+                }
+                self._request_save(immediate=True)
+                if not await asyncio.shield(self._flush()):
+                    raise ValueError(self._state["storage_error"])
+                answer.update(text=new_path, source=source, scope=[{"operation": "file.create", "target": target}])
+        return await self._task_command(task_id, action, answer or None)
 
     async def _task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
         result = await self._require_tasks().task_command(task_id, action, payload)

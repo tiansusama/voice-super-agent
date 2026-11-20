@@ -42,6 +42,7 @@ type TaskQuestion = {
   status: 'open' | 'answered' | 'closed';
   answer: string | null;
   step_id?: string | null;
+  requested_operation?: 'file.create';
 };
 
 export type TaskNotice = {
@@ -135,7 +136,10 @@ export function QuestionReply({ question, command }: { question: TaskQuestion; c
       onChange={event => setResolution(event.target.value as StepResolution | '')} disabled={pending} required>
       <option value="">选择实际结果</option>
       {Object.entries(stepResolutionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-    </select> : <textarea id={fieldId} value={text} onChange={event => setText(event.target.value)}
+    </select> : question.requested_operation === 'file.create' ?
+      <input id={fieldId} type="text" placeholder="新的绝对文件路径" value={text}
+        onChange={event => setText(event.target.value)} disabled={pending} required />
+      : <textarea id={fieldId} value={text} onChange={event => setText(event.target.value)}
       disabled={pending} rows={2} required />}
     <button type="submit" className="quiet-button" disabled={pending || !(question.step_id ? resolution : text.trim())}>
       {pending ? '正在提交…' : '提交答复'}

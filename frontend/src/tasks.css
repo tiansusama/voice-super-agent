@@ -10,8 +10,9 @@
 .task-detail { margin-top: 12px; }
 .task-detail small { display: block; margin-bottom: 14px; }
 .task-detail li { overflow-wrap: anywhere; }
-.task-answer label, .task-answer textarea { display: block; margin-bottom: 8px; }
-.task-answer textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fffdfb; color: var(--ink); font: inherit; resize: vertical; }
+.task-answer label, .task-answer textarea, .task-answer input { display: block; margin-bottom: 8px; }
+.task-answer textarea, .task-answer input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fffdfb; color: var(--ink); font: inherit; }
+.task-answer textarea { resize: vertical; }
 .task-answer select { margin: 0 8px 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fffdfb; color: var(--ink); }
 .task-steps { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; }
 .task-steps summary { cursor: pointer; }
