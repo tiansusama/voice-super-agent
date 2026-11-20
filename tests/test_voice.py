@@ -253,26 +253,23 @@ async def voice(tmp_path, monkeypatch, request):
     if mode == "tasks":
         class TestTasks(TaskStore):
             async def start(self):
-                self.changes = asyncio.Queue()
+                pass
 
             async def close(self):
                 pass
-
-            async def next_change(self):
-                return await self.changes.get()
 
             async def dispatch(self, source, plans):
                 cursor = await self.last_change_position()
                 result = await super().dispatch(source, plans)
                 for change in await self.list_changes(cursor):
-                    self.changes.put_nowait(change)
+                    await on_change(change)
                 return result
 
             async def save_result(self, task_id, result):
                 detail = await self.get_task(task_id)
                 detail["task"].update(state="completed", result=result, progress="", actions=[])
                 for change in await self.save_task(detail, [{"kind": "result", "text": result}]):
-                    self.changes.put_nowait(change)
+                    await on_change(change)
 
             async def save_question(self, task_id, text):
                 detail = await self.get_task(task_id)
@@ -282,12 +279,15 @@ async def voice(tmp_path, monkeypatch, request):
                 detail["task"].update(state="waiting_user", actions=["answer"])
                 for change in await self.save_task(detail, [{"kind": "question", "text": text,
                                                            "question_id": question["id"]}]):
-                    self.changes.put_nowait(change)
+                    await on_change(change)
 
-        def task_factory(store):
-            tasks = TestTasks(store)
-            harness.tasks = tasks
-            return tasks
+        def task_factory(store, notify):
+            nonlocal on_change
+            on_change = notify
+            harness.tasks = TestTasks(store)
+            return harness.tasks
+
+        on_change = None
     harness.detector = SimpleNamespace(reset=lambda: None, feed=lambda audio, rate: False)
     monkeypatch.setattr(runtime_module, "KeywordDetector", lambda directory, word: harness.detector)
     monkeypatch.setattr(HoldHotkey, "pressed", lambda self: False)

@@ -17,8 +17,8 @@ from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.task_tools import confirmed_scope, validate_task_arguments
 from voice_super_agent.tasks.interface import (
-    ShutdownProgress, TaskAction, TaskChange, TaskCommandPayload, TaskDetail, TaskPage,
-    TaskService, TaskSource, TaskSummary,
+    ShutdownProgress, TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail,
+    TaskPage, TaskRuntimeFault, TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
@@ -36,7 +36,7 @@ class Runtime:
 
     def __init__(self, desktop_check: bool = False, database_path: str | Path = ":memory:",
                  wake_model_dir: Path | None = None,
-                 task_factory: Callable[[ConversationStore], TaskService] | None = None):
+                 task_factory: Callable[[ConversationStore, TaskChangeHandler], TaskService] | None = None):
         self._loop = asyncio.new_event_loop()
         self._thread = Thread(target=self._loop.run_forever, name="agent-runtime")
         self.events: Queue[dict[str, Any] | None] = Queue()
@@ -70,6 +70,7 @@ class Runtime:
         self._tasks: TaskService | None = None
         self._task_reply_id: str | None = None
         self._task_projection: asyncio.Task | None = None
+        self._task_updates: asyncio.Queue[tuple[TaskChange | TaskRuntimeFault, int | None]] = asyncio.Queue()
         self._task_exit: asyncio.Task | None = None
         self._task_exit_lock = asyncio.Lock()
         self._task_position = 0
@@ -182,7 +183,7 @@ class Runtime:
             self._request_save(immediate=True)
         if self._task_factory is not None:
             try:
-                self._tasks = self._task_factory(self._store)
+                self._tasks = self._task_factory(self._store, self._on_task_change)
                 await self._tasks.start()
                 await self._project_task_changes()
                 limit = await self._tasks.get_concurrency()
@@ -254,14 +255,17 @@ class Runtime:
                 "messages": messages, "task_cards": [dict(task) for task in self._task_cards.values()
                                                       if task["source"]["message_id"] in visible]}
 
+    async def _on_task_change(self, change: TaskChange | TaskRuntimeFault) -> None:
+        activation = self._voice_activation if self._state["voice_status"] == "active" else None
+        self._task_updates.put_nowait((change, activation))
+
     async def _watch_task_changes(self) -> None:
         tasks = self._require_tasks()
         while True:
-            change = await tasks.next_change()
+            change, activation = await self._task_updates.get()
             fault = change["kind"] == "storage_error"
             if not fault and change["position"] <= self._task_position:
                 continue
-            activation = self._voice_activation if self._state["voice_status"] == "active" else None
             while True:
                 try:
                     detail = await tasks.get_task(change["task_id"])

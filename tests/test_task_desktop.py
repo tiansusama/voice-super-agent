@@ -12,6 +12,7 @@ from voice_super_agent.runtime import Runtime
 from voice_super_agent.tasks.mcp_client import MCPExecutionClient
 from voice_super_agent.tasks.runtime import TaskRuntime
 from voice_super_agent.tasks.store import TaskStore
+from voice_super_agent.tasks.worker import TaskWorker
 from voice_super_agent.tooling.interface import BuiltinTools
 
 
@@ -38,9 +39,6 @@ def test_desktop_task_operations_share_the_runtime_state():
         async def list_changes(self, after_position, limit):
             return []
 
-        async def next_change(self):
-            await asyncio.Future()
-
         async def get_task(self, task_id):
             return {"task": {"id": task_id, "state": self.state}}
 
@@ -50,7 +48,7 @@ def test_desktop_task_operations_share_the_runtime_state():
             return {"id": task_id, "state": self.state, "source": {"message_id": "message"}}
 
     tasks = TaskService()
-    runtime = Runtime(task_factory=lambda store: tasks)
+    runtime = Runtime(task_factory=lambda store, on_change: tasks)
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
@@ -75,9 +73,6 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
 
         async def close(self):
             pass
-
-        async def next_change(self):
-            await asyncio.Future()
 
     path = tmp_path / "tasks.sqlite3"
 
@@ -104,7 +99,7 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
 
     notification = asyncio.run(seed())
     for reopened in (False, True):
-        runtime = Runtime(database_path=path, task_factory=TaskService)
+        runtime = Runtime(database_path=path, task_factory=lambda store, on_change: TaskService(store))
         runtime.start()
         try:
             api = DesktopApi(runtime, "main")
@@ -153,7 +148,9 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn(tmp_path):
         await execution.complete("主窗口已隐藏")
 
     task_id = asyncio.run(seed())
-    runtime = Runtime(database_path=path, task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
+    runtime = Runtime(database_path=path, task_factory=lambda store, on_change: TaskRuntime(
+        store, worker, tools.reconcile_action, on_change=on_change,
+    ))
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
@@ -182,7 +179,6 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn(tmp_path):
 def test_task_projection_reports_transient_read_failure_and_keeps_processing():
     class TaskService:
         async def start(self):
-            self.events = asyncio.Queue()
             self.unreadable = True
 
         async def close(self):
@@ -194,9 +190,6 @@ def test_task_projection_reports_transient_read_failure_and_keeps_processing():
         async def list_changes(self, after_position, limit):
             return []
 
-        async def next_change(self):
-            return await self.events.get()
-
         async def get_task(self, task_id):
             if self.unreadable:
                 self.unreadable = False
@@ -204,14 +197,19 @@ def test_task_projection_reports_transient_read_failure_and_keeps_processing():
             return {"task": {"id": task_id, "title": "生成清单", "source": {"message_id": "message"}}, "questions": []}
 
     tasks = TaskService()
-    runtime = Runtime(task_factory=lambda store: tasks)
+
+    def task_factory(store, on_change):
+        tasks.notify = on_change
+        return tasks
+
+    runtime = Runtime(task_factory=task_factory)
     runtime.start()
     try:
-        runtime._loop.call_soon_threadsafe(tasks.events.put_nowait, {
+        asyncio.run_coroutine_threadsafe(tasks.notify({
             "id": "result", "position": 1, "task_id": "task", "source": "text", "kind": "result",
             "read": False, "question_id": None, "step_id": None, "text": "产物已保存",
             "created_at": "2026-11-20T03:00:00+00:00",
-        })
+        }), runtime._loop).result()
         while not (snapshot := runtime.events.get(timeout=3)["snapshot"])["state"]["task_error"]:
             pass
         assert "测试读取暂不可用" in snapshot["state"]["task_error"]
@@ -231,17 +229,23 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     tools = BuiltinTools(applications=None)
     fail_before_dispatch = dispatch_on_retry
 
-    async def worker(execution):
-        detail = await execution.get_task()
-        async with MCPExecutionClient(tools.create_server(execution, detail["scope"])) as session:
-            result = await session.call_tool("create_text_file", {"path": target, "content": "测试产物"})
-        assert result["structuredContent"]["path"] == target
-        await execution.complete("报告已生成")
-
     async def complete(request):
         nonlocal fail_before_dispatch
         body = await request.json()
         message = body["messages"][-1]
+        if not body["stream"]:
+            if message["role"] == "tool":
+                name, arguments = "task_complete", {"text": "报告已生成"}
+                assert json.loads(message["content"])["structuredContent"]["path"] == target
+            else:
+                name, arguments = "create_text_file", {"path": target, "content": "测试产物", "final_step": True}
+            return web.json_response({
+                "id": "worker", "object": "chat.completion", "created": 0, "model": "test",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "tool_calls": [{"id": name, "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)}}],
+                }}],
+            })
         if message["role"] == "tool":
             result = json.loads(message["content"])
             tool_results.put_nowait(result)
@@ -272,10 +276,14 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     site = web.TCPSite(server, "127.0.0.1", 0)
     await site.start()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "task-test-key")
-    monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{server.addresses[0][1]}")
+    base_url = f"http://127.0.0.1:{server.addresses[0][1]}"
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", base_url)
+    worker = TaskWorker(tools.create_server, api_key="task-test-key", base_url=base_url)
     def new_runtime():
         return Runtime(database_path=tmp_path / "desktop.sqlite3",
-                       task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
+                       task_factory=lambda store, on_change: TaskRuntime(
+                           store, worker, tools.reconcile_action, on_change=on_change,
+                       ))
 
     async def wait_for_failed_reply(reply_id):
         async with asyncio.timeout(5):
