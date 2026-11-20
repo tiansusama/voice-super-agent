@@ -20,6 +20,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   const state = snapshot.state;
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const tasksAvailable = state.task_concurrency != null;
+  const waitingForExit = state.task_shutdown?.requested && !state.exiting;
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
   const canOperate = !state.exiting && !state.restarting && !state.storage_error && !state.exit_error;
   const canSend = state.model_available && canOperate && !voiceSwitching;
@@ -75,8 +76,15 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
     sendingRef.current = true;
     setSending(true);
     try {
-      if (originalMessageId) await window.pywebview!.api.resend_text(originalMessageId);
-      else {
+      if (originalMessageId) {
+        const sent = await window.pywebview!.api.resend_text(originalMessageId);
+        if (sent.existing_task_ids?.length) {
+          setSelectedTask(sent.existing_task_ids.length === 1 ? sent.existing_task_ids[0] : null);
+          setPage('tasks');
+          setError('');
+          return;
+        }
+      } else {
         await window.pywebview!.api.send_text(text);
         setDraft(current => current === draft ? '' : current);
       }
@@ -98,11 +106,11 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   }
 
   const taskCommand: RunTaskAction = (taskId, action, payload) =>
-    window.pywebview!.api.task_command!(taskId, action, payload);
+    window.pywebview!.api.task_command(taskId, action, payload);
 
   async function openTaskNotice(notice: TaskNotice) {
     try {
-      if (!notice.read) await window.pywebview!.api.mark_task_read!(notice.id);
+      if (!notice.read) await window.pywebview!.api.mark_task_read(notice.id);
       setError('');
       openTask(notice.task_id);
     } catch (reason) {
@@ -155,8 +163,17 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
               <RotateCcw size={15} />恢复语音</button>}</div>}
           {state.model_error && <div className="notice warning" role="alert"><p>{state.model_error}</p></div>}
           {state.storage_error && <div className="notice warning" role="alert"><p>{state.storage_error}</p></div>}
+          {state.task_error && <div className="notice warning" role="alert"><p>{state.task_error}</p></div>}
           {state.exit_error && <div className="notice warning" role="alert"><p>{state.exit_error}</p>
             <button className="notice-action" onClick={() => void command('quit')} disabled={state.exiting}>再次退出</button></div>}
+          {waitingForExit && <div className="notice" role="status">
+            <div><p>{state.task_shutdown!.ready ? '退出尚未完成' : '等待当前步骤完成后退出'}</p>
+              {state.task_shutdown!.waiting.map((step, index) =>
+                <p key={step.step_id ?? `${step.task_id}-${index}`}>{step.title ?? step.task_id}
+                  {(step.tool || step.step_id) && ` · ${step.tool || step.step_id}`}</p>)}
+            </div>
+            <button className="notice-action" onClick={() => void command('withdraw_task_exit')}>撤回退出</button>
+          </div>}
           {state.voice_recovery === 'running' && <div className="notice" role="status">正在恢复语音…</div>}
           {state.voice_recovery === 'succeeded' && state.voice_status === 'standby' &&
             <div className="notice" role="status"><Check size={16} />语音已恢复，等待再次唤醒。</div>}
@@ -241,7 +258,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
           open={openTask} close={() => setSelectedTask(null)} command={taskCommand} />}
         {page === 'settings' && <SettingsPanel state={state} command={command}>
           {state.task_concurrency != null && <TaskConcurrencySetting limit={state.task_concurrency}
-            save={limit => window.pywebview!.api.save_task_concurrency!(limit)} disabled={!canOperate} />}
+            save={limit => window.pywebview!.api.save_task_concurrency(limit)} disabled={!canOperate} />}
         </SettingsPanel>}
 
         {state.desktop_check && <section className="desktop-check"><details><summary>桌面联调 · 后台计数 {state.activity_tick} · 状态序号 {snapshot.sequence}</summary>

@@ -55,6 +55,8 @@ interface DesktopSnapshot {
     exit_error: string;
     task_revision?: number;
     task_concurrency?: number | null;
+    task_shutdown?: { requested: boolean; ready: boolean; waiting: { task_id: string; title?: string; step_id?: string; tool?: string }[]; error: string } | null;
+    task_error?: string;
   };
 }
 
@@ -101,16 +103,16 @@ interface Window {
       connect(): Promise<DesktopConnection>;
       command(name: string): Promise<void>;
       send_text(text: string): Promise<{ user_message_id: string; reply_id: string }>;
-      resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string }>;
+      resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string; existing_task_ids?: string[] }>;
       save_setting(name: SettingName, value: string | number): Promise<{ pending: boolean }>;
       list_history(before_position?: number): Promise<HistoryPage>;
       read_history(message_id: string, offset?: number): Promise<HistoryOriginal>;
       floating_layout(card_height: number, controls_visible: boolean, hint_visible: boolean): Promise<void>;
-      list_tasks?(cursor?: number): Promise<{ tasks: import('./TaskPanel').TaskSummary[]; next_cursor: number | null }>;
-      get_task?(task_id: string): Promise<import('./TaskPanel').TaskDetail>;
-      task_command?: import('./TaskPanel').RunTaskAction;
-      save_task_concurrency?(limit: number): Promise<number>;
-      mark_task_read?(notification_id: string): Promise<void>;
+      list_tasks(cursor?: number): Promise<{ tasks: import('./TaskPanel').TaskSummary[]; next_cursor: number | null }>;
+      get_task(task_id: string): Promise<import('./TaskPanel').TaskDetail>;
+      task_command: import('./TaskPanel').RunTaskAction;
+      save_task_concurrency(limit: number): Promise<number>;
+      mark_task_read(notification_id: string): Promise<void>;
     };
   };
 }

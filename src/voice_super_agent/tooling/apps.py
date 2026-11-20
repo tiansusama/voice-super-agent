@@ -14,6 +14,7 @@ class Application:
     name: str
     kind: Literal["apps", "exe"]
     target: str
+    executable: Path | None = None
 
 
 class AppPlatform(Protocol):
@@ -96,16 +97,45 @@ class WindowsApps:
 
     def installed(self) -> list[Application]:
         powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        script = """
+            $ErrorActionPreference = 'Stop'
+            [Console]::OutputEncoding = [Text.Encoding]::UTF8
+            $shell = New-Object -ComObject Shell.Application
+            $items = $shell.NameSpace('shell:AppsFolder').Items()
+            $catalog = foreach ($item in $items) {
+                [pscustomobject]@{
+                    Name = $item.Name
+                    AppID = $item.Path
+                    Executable = $item.ExtendedProperty('System.Link.TargetParsingPath')
+                }
+            }
+            ConvertTo-Json -InputObject @($catalog) -Compress
+        """
         result = subprocess.run(
-            [str(powershell), "-NoProfile", "-NonInteractive", "-Command",
-             "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [Text.Encoding]::UTF8;"
-             " ConvertTo-Json -InputObject @(Get-StartApps | Select-Object Name, AppID) -Compress"],
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
             creationflags=subprocess.CREATE_NO_WINDOW,
             capture_output=True, text=True, encoding="utf-8-sig", timeout=10,
         )
         if result.returncode:
             raise RuntimeError(f"无法读取开始菜单应用：{result.stderr.strip()}")
-        return [Application(item["Name"], "apps", item["AppID"]) for item in json.loads(result.stdout)]
+        entries = [item for item in json.loads(result.stdout) if item["Name"] and item["AppID"]]
+        paths: dict[str, Path] = {}
+        owners: dict[Path, set[str]] = {}
+        for item in entries:
+            if not item["Executable"]:
+                continue
+            path = Path(item["Executable"])
+            if not path.is_absolute() or path.suffix.casefold() != ".exe" or not path.is_file():
+                continue
+            path = path.resolve()
+            paths[item["AppID"]] = path
+            owners.setdefault(path, set()).add(item["AppID"])
+        applications = []
+        for item in entries:
+            path = paths.get(item["AppID"])
+            executable = path if path is not None and len(owners[path]) == 1 else None
+            applications.append(Application(item["Name"], "apps", item["AppID"], executable))
+        return applications
 
     def _matches(self, window: int, application: Application) -> bool:
         pid = wintypes.DWORD()
@@ -115,14 +145,19 @@ class WindowsApps:
             # 枚举期间窗口可能关闭，也可能属于当前用户无权读取的进程。
             return False
         try:
-            target = ctypes.create_unicode_buffer(32768 if application.kind == "exe" else 256)
-            size = wintypes.DWORD(len(target))
-            if application.kind == "exe":
-                if not self._kernel.QueryFullProcessImageNameW(process, 0, target, ctypes.byref(size)):
-                    return False
-            elif self._kernel.GetApplicationUserModelId(process, ctypes.byref(size), target) != 0:
+            if application.kind == "apps":
+                app_id = ctypes.create_unicode_buffer(256)
+                size = wintypes.DWORD(len(app_id))
+                if self._kernel.GetApplicationUserModelId(process, ctypes.byref(size), app_id) == 0:
+                    return app_id.value.casefold() == application.target.casefold()
+            executable = Path(application.target) if application.kind == "exe" else application.executable
+            if executable is None:
                 return False
-            return target.value.casefold() == application.target.casefold()
+            # 传统桌面程序没有进程 AppID 时，使用开始菜单登记的唯一可执行文件。
+            image = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(image))
+            return bool(self._kernel.QueryFullProcessImageNameW(process, 0, image, ctypes.byref(size))
+                        and Path(image.value) == executable)
         finally:
             self._kernel.CloseHandle(process)
 

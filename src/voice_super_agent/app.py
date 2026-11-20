@@ -60,8 +60,8 @@ def main() -> None:
 
         runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3",
                           wake_model_dir=PROJECT_ROOT / "resources" / "models" / MODEL_NAME)
-        runtime.start()
         try:
+            runtime.start()
             desktop = Desktop(runtime, page)
             instance.watch(desktop.activate)
             try:

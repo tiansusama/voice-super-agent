@@ -23,6 +23,7 @@ from voice_super_agent.runtime import Runtime
 from voice_super_agent import runtime as runtime_module
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.audio.devices import AudioDevices, Endpoint
+from voice_super_agent.tasks.store import TaskStore
 from voice_super_agent.voice import pipeline as voice_pipeline
 from voice_super_agent.voice import volcengine
 
@@ -246,12 +247,52 @@ async def voice(tmp_path, monkeypatch, request):
     for key in ("DEEPSEEK_API_KEY", "VOLCENGINE_API_KEY", "ARK_API_KEY"):
         monkeypatch.setenv(key, "test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", url)
-    standby = getattr(request, "param", False)
+    mode = getattr(request, "param", False)
+    standby = mode is True or mode == "tasks"
+    task_factory = None
+    if mode == "tasks":
+        class TestTasks(TaskStore):
+            async def start(self):
+                self.changes = asyncio.Queue()
+
+            async def close(self):
+                pass
+
+            async def next_change(self):
+                return await self.changes.get()
+
+            async def dispatch(self, source, plans):
+                cursor = await self.last_change_position()
+                result = await super().dispatch(source, plans)
+                for change in await self.list_changes(cursor):
+                    self.changes.put_nowait(change)
+                return result
+
+            async def save_result(self, task_id, result):
+                detail = await self.get_task(task_id)
+                detail["task"].update(state="completed", result=result, progress="", actions=[])
+                for change in await self.save_task(detail, [{"kind": "result", "text": result}]):
+                    self.changes.put_nowait(change)
+
+            async def save_question(self, task_id, text):
+                detail = await self.get_task(task_id)
+                question = {"id": "output-question", "task_id": task_id, "execution_id": None, "step_id": None,
+                            "status": "open", "answer": None, "text": text, "created_at": detail["task"]["created_at"]}
+                detail["questions"].append(question)
+                detail["task"].update(state="waiting_user", actions=["answer"])
+                for change in await self.save_task(detail, [{"kind": "question", "text": text,
+                                                           "question_id": question["id"]}]):
+                    self.changes.put_nowait(change)
+
+        def task_factory(store):
+            tasks = TestTasks(store)
+            harness.tasks = tasks
+            return tasks
     harness.detector = SimpleNamespace(reset=lambda: None, feed=lambda audio, rate: False)
     monkeypatch.setattr(runtime_module, "KeywordDetector", lambda directory, word: harness.detector)
     monkeypatch.setattr(HoldHotkey, "pressed", lambda self: False)
     harness.runtime = Runtime(desktop_check=True, database_path=tmp_path / "voice.sqlite3",
-                              wake_model_dir=tmp_path if standby else None)
+                              wake_model_dir=tmp_path if standby else None, task_factory=task_factory)
     harness.runtime.start()
     if not standby:
         harness.runtime.command("start_voice")
@@ -270,6 +311,68 @@ async def voice(tmp_path, monkeypatch, request):
         await asyncio.to_thread(harness.runtime.stop)
         await server.cleanup()
         logger.enable("pipecat")
+
+
+@pytest.mark.parametrize("voice", ["tasks"], indirect=True)
+@pytest.mark.asyncio
+async def test_saved_voice_task_results_play_when_idle_and_stay_unread_in_standby(voice):
+    voice.tools["显示小博主窗口。"] = ("dispatch_tasks", {"plans": [{
+        "key": "show", "title": "显示主窗口", "goal": "显示小博",
+        "scope": [{"operation": "window.show", "target": "小博主窗口"}],
+    }]})
+    await voice.wake()
+    voice.release_audio()
+    await voice.transcript("显示小博主窗口。")
+    snapshot = await voice.wait(lambda s: s["task_cards"] and s["state"]["voice_playing"])
+    task = snapshot["task_cards"][0]
+    assert task["source"]["source"] == "voice"
+    await voice.backend(voice.tasks.save_result(task["id"], "窗口显示完成"))
+
+    heard = await voice.wait(lambda s: any(message.get("task_notice", {}).get("read")
+                                           for message in s["messages"]))
+    assert any("窗口显示完成" in request["req_params"]["text"] for request in voice.tts_requests)
+    assert len([message for message in heard["messages"] if message.get("task_notice")]) == 1
+    voice.runtime.command("end_voice")
+    await voice.wait(lambda s: s["state"]["voice_status"] == "standby")
+    await voice.backend(voice.tasks.save_result(task["id"], "待唤醒时完成"))
+    await voice.wait(lambda s: any("待唤醒时完成" in message["text"] and not message["task_notice"]["read"]
+                                   for message in s["messages"]))
+    await voice.wake()
+    await asyncio.sleep(0.22)
+    assert not any("待唤醒时完成" in request["req_params"]["text"] for request in voice.tts_requests)
+    await voice.backend(voice.tasks.save_result(task["id"], "播报中途接管"))
+    await voice.wait(lambda s: s["state"]["voice_playing"]
+                     and any("播报中途接管" in request["req_params"]["text"] for request in voice.tts_requests))
+    accepted = voice.runtime.send_text("切回文字")
+    voice.release_audio()
+    interrupted = await voice.wait(lambda s: any(message["id"] == accepted["reply_id"] and message["status"] == "completed"
+                                                for message in s["messages"]))
+    assert not next(message["task_notice"]["read"] for message in interrupted["messages"]
+                    if "播报中途接管" in message["text"])
+
+
+@pytest.mark.parametrize("voice", ["tasks"], indirect=True)
+@pytest.mark.asyncio
+async def test_queued_task_question_plays_before_a_waiting_result(voice):
+    voice.tools["显示小博主窗口。"] = ("dispatch_tasks", {"plans": [
+        {"key": key, "title": title, "goal": "显示小博",
+         "scope": [{"operation": "window.show", "target": "小博主窗口"}]}
+        for key, title in (("a", "任务甲"), ("b", "任务乙"))
+    ]})
+    await voice.wake()
+    await voice.transcript("显示小博主窗口。")
+    snapshot = await voice.wait(lambda s: len(s["task_cards"]) == 2 and s["state"]["voice_playing"])
+    tasks = {task["title"]: task["id"] for task in snapshot["task_cards"]}
+    await voice.backend(voice.tasks.save_result(tasks["任务甲"], "第一个任务已有结果"))
+    await voice.backend(voice.tasks.save_question(tasks["任务乙"], "请回答第二个任务的问题"))
+    await voice.wait(lambda s: sum(bool(message.get("task_notice")) for message in s["messages"]) == 2)
+    voice.release_audio()
+    await voice.wait(lambda s: sum(bool(message.get("task_notice", {}).get("read")) for message in s["messages"]) == 2)
+
+    spoken = [request["req_params"]["text"] for request in voice.tts_requests]
+    question = next(index for index, text in enumerate(spoken) if "请回答第二个任务的问题" in text)
+    result = next(index for index, text in enumerate(spoken) if "第一个任务已有结果" in text)
+    assert question < result
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ from pipecat.frames.frames import (
     LLMContextFrame, LLMContextUserTurnFrame, LLMConfigureOutputFrame, TranscriptionFrame, UserBackchannelFrame,
     VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
     FunctionCallsStartedFrame, FunctionCallResultFrame, FunctionCallCancelFrame,
-    InputAudioRawFrame,
+    InputAudioRawFrame, TTSSpeakFrame,
 )
 from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
 from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
@@ -141,6 +141,8 @@ class Conversation:
         self._history_calls = {}
         self._task_command = task_command
         self._task_call_replies: dict[str, str] = {}
+        self._task_feedback_id: str | None = None
+        self._task_feedback_started = False
         task_tools = task_schemas(self._task_call) if task_command is not None else []
         task_tool_names = {tool.name for tool in task_tools}
         history_tools = [FunctionSchema(
@@ -200,6 +202,12 @@ class Conversation:
                 empty_user_turn=None,
             ))
         processors = self._voice.processors(self._user, self._llm, assistant) if voice else [self._user, self._llm, assistant]
+        if voice:
+            @self._voice.transport.output().event_handler("on_before_process_frame")
+            async def on_output(processor, frame):
+                if isinstance(frame, (InterruptionFrame, CancelFrame)):
+                    self._finish_task_feedback(played=False)
+
         self._worker = PipelineWorker(
             Pipeline(processors),
             params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=24000),
@@ -358,13 +366,18 @@ class Conversation:
 
         async def on_service_error(processor, error):
             service, label = services.get(processor, ("pipeline", "对话处理失败"))
-            self._failed = True
-            self._failure_reason = f"{label}：{error.error}"
-            reply_id = self._generation_reply_id if service in {"model", "tts"} else self._reply_id
+            reason = f"{label}：{error.error}"
+            if self._task_feedback_id is not None and service in {"tts", "audio"}:
+                self._finish_task_feedback(played=False)
+                reply_id = None
+            else:
+                self._failed = True
+                self._failure_reason = reason
+                reply_id = self._generation_reply_id if service in {"model", "tts"} else self._reply_id
             if self._voice_pending is not None and service in {"asr", "system_one"}:
                 reply_id = self._voice_pending["reply_id"]
             # 原生分类和可用性判定已在 on_error 前完成，保留其具体失败语义。
-            self._emit({"type": "error", "reply_id": reply_id, "error": self._failure_reason,
+            self._emit({"type": "error", "reply_id": reply_id, "error": reason,
                         "service": service, "category": error.category.value,
                         "permanent": error.fatal or not processor.is_usable, "voice": self.voice_enabled})
 
@@ -410,7 +423,24 @@ class Conversation:
         elif isinstance(frame, (BotStartedSpeakingFrame, BotStoppedSpeakingFrame)):
             self._busy("playback", isinstance(frame, BotStartedSpeakingFrame))
             if isinstance(frame, BotStoppedSpeakingFrame):
+                if self._task_feedback_started:
+                    self._finish_task_feedback(played=True)
                 self._voice.playback_stopped()
+            elif self._task_feedback_id is not None:
+                self._task_feedback_started = True
+
+    async def speak_task_feedback(self, notification_id: str, text: str) -> bool:
+        if self._voice.gate.mode != "active" or self._voice.boundary.frozen or self._closing:
+            return False
+        self._task_feedback_id = notification_id
+        await self._worker.queue_frame(TTSSpeakFrame(text=text, append_to_context=False))
+        return True
+
+    def _finish_task_feedback(self, *, played: bool) -> None:
+        if self._task_feedback_id is not None:
+            notification_id, self._task_feedback_id = self._task_feedback_id, None
+            self._task_feedback_started = False
+            self._emit({"type": "task_feedback_finished", "notification_id": notification_id, "played": played})
 
     async def _history_call(self, params):
         reply_id = self._generation_reply_id

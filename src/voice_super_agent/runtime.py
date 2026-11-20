@@ -17,7 +17,8 @@ from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.task_tools import confirmed_scope, validate_task_arguments
 from voice_super_agent.tasks.interface import (
-    TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage, TaskService, TaskSource, TaskSummary,
+    ShutdownProgress, TaskAction, TaskChange, TaskCommandPayload, TaskDetail, TaskPage,
+    TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
@@ -35,7 +36,7 @@ class Runtime:
 
     def __init__(self, desktop_check: bool = False, database_path: str | Path = ":memory:",
                  wake_model_dir: Path | None = None,
-                 task_factory: Callable[[ConversationStore, TaskChangeHandler], TaskService] | None = None):
+                 task_factory: Callable[[ConversationStore], TaskService] | None = None):
         self._loop = asyncio.new_event_loop()
         self._thread = Thread(target=self._loop.run_forever, name="agent-runtime")
         self.events: Queue[dict[str, Any] | None] = Queue()
@@ -69,11 +70,15 @@ class Runtime:
         self._tasks: TaskService | None = None
         self._task_reply_id: str | None = None
         self._task_projection: asyncio.Task | None = None
-        self._task_changes = asyncio.Event()
+        self._task_exit: asyncio.Task | None = None
+        self._task_exit_lock = asyncio.Lock()
         self._task_position = 0
         self._task_cards: dict[str, TaskSummary] = {}
         self._task_notices: dict[str, TaskChange] = {}
         self._task_questions: dict[str, dict] = {}
+        self._task_speech_queue: list[TaskChange] = []
+        self._task_speaking: str | None = None
+        self._voice_activation = 0
         self._storage_ready = False
         self._revision = 0
         self._saved_revision = 0
@@ -128,6 +133,8 @@ class Runtime:
             "exit_error": "",
             "task_revision": 0,
             "task_concurrency": None,
+            "task_shutdown": None,
+            "task_error": "",
         }
 
     def start(self) -> None:
@@ -174,11 +181,22 @@ class Runtime:
         if unfinished:
             self._request_save(immediate=True)
         if self._task_factory is not None:
-            self._tasks = self._task_factory(self._store, self._task_changed)
-            await self._tasks.start()
-            await self._project_task_changes()
-            self._task_projection = asyncio.create_task(self._watch_task_changes(), name="task-notifications")
-            self._update({"task_concurrency": await self._tasks.get_concurrency()})
+            try:
+                self._tasks = self._task_factory(self._store)
+                await self._tasks.start()
+                await self._project_task_changes()
+                limit = await self._tasks.get_concurrency()
+            except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
+                self._update({"task_error": f"后台任务启动失败：{exc}"})
+                if self._tasks is not None:
+                    tasks, self._tasks = self._tasks, None
+                    try:
+                        await tasks.close()
+                    except (sqlite3.Error, OSError, RuntimeError) as close_error:
+                        logger.error("关闭启动失败的任务运行时：%s", close_error)
+            else:
+                self._task_projection = asyncio.create_task(self._watch_task_changes(), name="task-notifications")
+                self._update({"task_concurrency": limit})
         logger.info("已恢复 %s 条展示消息、%s 条原生模型消息", len(self._messages), len(self._model_records))
         self._idle_task = asyncio.create_task(self._watch_idle(), name="voice-idle")
         if self._wake_model_dir is not None:
@@ -202,6 +220,11 @@ class Runtime:
         self._loop.call_soon_threadsafe(self._update, changes)
 
     def _update(self, changes: dict[str, Any]) -> None:
+        if self._state["voice_status"] == "active" and changes.get("voice_status", "active") != "active":
+            self._voice_activation += 1
+            self._task_speech_queue.clear()
+            self._task_speaking = None
+            self._lifecycle.activity("task_feedback", False, self._loop.time())
         self._state.update(changes)
         state = self._state
         current_error = state["last_error"] and state["last_error"]["reply_id"] == state["floating_reply_id"]
@@ -231,39 +254,56 @@ class Runtime:
                 "messages": messages, "task_cards": [dict(task) for task in self._task_cards.values()
                                                       if task["source"]["message_id"] in visible]}
 
-    async def _task_changed(self, change: TaskChange) -> None:
-        self._task_changes.set()
-
     async def _watch_task_changes(self) -> None:
+        tasks = self._require_tasks()
         while True:
-            await self._task_changes.wait()
-            self._task_changes.clear()
-            await self._project_task_changes()
+            change = await tasks.next_change()
+            fault = change["kind"] == "storage_error"
+            if not fault and change["position"] <= self._task_position:
+                continue
+            activation = self._voice_activation if self._state["voice_status"] == "active" else None
+            while True:
+                try:
+                    detail = await tasks.get_task(change["task_id"])
+                    break
+                except (sqlite3.Error, OSError) as exc:
+                    error = f"读取任务更新失败：{exc}"
+                    if self._state["task_error"] != error:
+                        self._update({"task_error": error})
+                    await asyncio.sleep(0.5)
+            if fault:
+                self._task_cards[change["task_id"]] = detail["task"]
+            else:
+                self._project_task_change(change, detail, activation)
+            self._update({"task_revision": self._state["task_revision"] + 1, "task_error": ""})
 
     async def _project_task_changes(self) -> None:
         tasks = self._require_tasks()
-        projected = False
         while batch := await tasks.list_changes(self._task_position, 100):
             details = {task_id: await tasks.get_task(task_id) for task_id in dict.fromkeys(change["task_id"] for change in batch)}
-            for task_id, detail in details.items():
-                self._task_cards[task_id] = detail["task"]
-                self._task_questions.update((question["id"], question) for question in detail["questions"])
             for change in batch:
-                if change["kind"] in {"question", "result", "error"}:
-                    message_id = f'task-{change["id"]}'
-                    self._task_notices[message_id] = change
-                    if message_id not in self._messages:
-                        task = details[change["task_id"]]["task"]
-                        self._messages[message_id] = {
-                            "id": message_id, "role": "assistant", "source": change["source"], "reply_id": message_id,
-                            "text": f'{task["title"]} · {change["text"]}', "status": "completed",
-                            "created_at": change["created_at"], "error": "",
-                        }
-                        self._request_save(immediate=True)
-                self._task_position = change["position"]
-                projected = True
-        if projected:
-            self._update({"task_revision": self._state["task_revision"] + 1})
+                self._project_task_change(change, details[change["task_id"]], activation=None)
+
+    def _project_task_change(self, change: TaskChange, detail: TaskDetail, activation: int | None) -> None:
+        task = detail["task"]
+        self._task_cards[task["id"]] = task
+        self._task_questions.update((question["id"], question) for question in detail["questions"])
+        self._task_position = change["position"]
+        if change["kind"] not in {"question", "result", "error", "supplement"}:
+            return
+        message_id = f'task-{change["id"]}'
+        self._task_notices[message_id] = change
+        if message_id in self._messages:
+            return
+        self._messages[message_id] = {
+            "id": message_id, "role": "assistant", "source": change["source"], "reply_id": message_id,
+            "text": f'{task["title"]} · {change["text"]}', "status": "completed",
+            "created_at": change["created_at"], "error": "",
+        }
+        self._request_save(immediate=True)
+        if (activation == self._voice_activation and change["source"] == "voice" and not change["read"]
+                and change["kind"] in {"question", "result"}):
+            self._task_speech_queue.append(change)
 
     def _require_tasks(self) -> TaskService:
         if self._tasks is None:
@@ -282,7 +322,6 @@ class Runtime:
     async def _task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
         result = await self._require_tasks().task_command(task_id, action, payload)
         self._task_cards[task_id] = result
-        self._task_changes.set()
         self._update({"task_revision": self._state["task_revision"] + 1})
         return result
 
@@ -334,7 +373,7 @@ class Runtime:
             )} for plan in arguments["plans"]]
         else:
             payload = TaskCommandPayload(source=source)
-            for field in ("text", "question_id"):
+            for field in ("text", "question_id", "resolution"):
                 if field in arguments:
                     payload[field] = arguments[field]
             if "scope" in arguments:
@@ -346,9 +385,7 @@ class Runtime:
         # 完成输入保存后再检查接管状态，已经提交的任务由任务运行时持续执行。
         self._task_source(reply_id)
         if name == "dispatch_tasks":
-            batch = await asyncio.shield(tasks.dispatch(source, plans))
-            self._task_changes.set()
-            return batch
+            return await asyncio.shield(tasks.dispatch(source, plans))
         result = await asyncio.shield(self._task_command(arguments["task_id"], arguments["action"], payload))
         return {"task": result}
 
@@ -466,14 +503,21 @@ class Runtime:
     def send_text(self, text: str) -> dict[str, str]:
         return asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop).result()
 
-    def resend_text(self, user_message_id: str) -> dict[str, str]:
+    def resend_text(self, user_message_id: str) -> dict[str, Any]:
         return asyncio.run_coroutine_threadsafe(self._resend_text(user_message_id), self._loop).result()
 
-    async def _resend_text(self, user_message_id: str) -> dict[str, str]:
+    async def _resend_text(self, user_message_id: str) -> dict[str, Any]:
         message = self._messages[user_message_id]
         if (message["role"] != "user" or message["source"] != "text"
                 or self._messages[message["reply_id"]]["status"] != "failed"):
             raise ValueError("只能重新发送回答失败的文字消息。")
+        if self._tasks is not None:
+            batch = await self._tasks.find_batch(user_message_id)
+            if batch is not None:
+                self._task_cards.update((task["id"], task) for task in batch["tasks"])
+                self._update({"task_revision": self._state["task_revision"] + 1})
+                return {"user_message_id": user_message_id, "reply_id": message["reply_id"],
+                        "existing_task_ids": [task["id"] for task in batch["tasks"]]}
         # 从后台原消息读取正文，沿普通发送路径追加新输入并执行接管。
         return await self._send_text(message["text"])
 
@@ -718,7 +762,39 @@ class Runtime:
         while True:
             if self._lifecycle.should_end(self._loop.time()) and self._state["voice_status"] == "active":
                 await self._command("end_voice")
+            elif self._task_speech_queue and self._task_voice_ready():
+                await self._speak_task_feedback()
             await asyncio.sleep(0.05)
+
+    def _task_voice_ready(self) -> bool:
+        return (self._state["voice_status"] == "active" and not self._lifecycle.busy
+                and self._state["active_reply_id"] is None and not self._state["exiting"]
+                and not self._state["restarting"] and self._lifecycle.ending_reply is None)
+
+    async def _speak_task_feedback(self) -> None:
+        activation = self._voice_activation
+        if not await asyncio.shield(self._flush()) or activation != self._voice_activation or not self._task_voice_ready():
+            return
+        if not self._task_speech_queue:
+            return
+        index = next((i for i, change in enumerate(self._task_speech_queue) if change["kind"] == "question"), 0)
+        notice = self._task_speech_queue.pop(index)
+        message_id = f'task-{notice["id"]}'
+        if (self._task_notices[message_id]["read"] or notice["kind"] == "question"
+                and self._task_questions[notice["question_id"]]["status"] != "open"):
+            return
+        task = self._task_cards[notice["task_id"]]
+        self._task_speaking = notice["id"]
+        self._lifecycle.activity("task_feedback", True, self._loop.time())
+        if not await self._conversation.speak_task_feedback(notice["id"], f'{task["title"]}。{notice["text"][:180]}'):
+            self._task_speaking = None
+            self._lifecycle.activity("task_feedback", False, self._loop.time())
+
+    async def _record_heard_task(self, notification_id: str) -> None:
+        try:
+            await self._mark_task_read(notification_id)
+        except (sqlite3.Error, OSError) as exc:
+            logger.error("保存任务通知已播报状态失败：%s", exc)
 
     async def _use_default_audio(self):
         transport = self._conversation._voice.transport
@@ -769,6 +845,13 @@ class Runtime:
                                   "microphone_level": 0.0, "playback_level": 0.0, "audio_device_pending": False})
 
     def _conversation_event(self, event: dict[str, Any]) -> None:
+        if event["type"] == "task_feedback_finished":
+            if event["notification_id"] == self._task_speaking:
+                self._task_speaking = None
+                self._lifecycle.activity("task_feedback", False, self._loop.time())
+                if event["played"]:
+                    asyncio.create_task(self._record_heard_task(event["notification_id"]), name="task-notice-heard")
+            return
         if event["type"] == "history":
             self._update({"history_status": "reading" if event["active"] else event["status"],
                           "history_reply_id": event["reply_id"], "history_error": event["error"]})
@@ -963,6 +1046,55 @@ class Runtime:
     def prepare_exit(self) -> bool:
         return asyncio.run_coroutine_threadsafe(self._prepare_exit(), self._loop).result()
 
+    async def _wait_for_task_exit(self) -> None:
+        tasks = self._require_tasks()
+        self._update({"exit_error": ""})
+        waiting_visible = False
+        try:
+            while True:
+                async with self._task_exit_lock:
+                    progress = await tasks.request_shutdown()
+                    waiting = []
+                    for entry in progress["waiting"]:
+                        detail = await tasks.get_task(entry["task_id"])
+                        step = next((step for step in detail["steps"] if step["id"] == entry["step_id"]), None)
+                        waiting.append({**entry, "title": detail["task"]["title"],
+                                        "tool": step["request"]["tool"] if step is not None else ""})
+                    progress = {**progress, "waiting": waiting}
+                    if progress != self._state["task_shutdown"]:
+                        self._update({"task_shutdown": progress})
+                    if progress["error"]:
+                        self._update({"exit_error": progress["error"]})
+                        self.events.put({"kind": "command", "command": "show_main"})
+                        return
+                    if progress["ready"]:
+                        if await self._prepare_exit():
+                            self.events.put({"kind": "command", "command": "quit_ready"})
+                        else:
+                            self.events.put({"kind": "command", "command": "show_main"})
+                        return
+                    if not waiting_visible:
+                        self.events.put({"kind": "command", "command": "show_main"})
+                        waiting_visible = True
+                await asyncio.sleep(0.15)
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            self._update({"exit_error": f"保存任务退出状态失败：{exc}"})
+            self.events.put({"kind": "command", "command": "show_main"})
+
+    async def _withdraw_task_exit(self) -> None:
+        async with self._task_exit_lock:
+            if self._exit_prepared:
+                raise ValueError("应用正在关闭。")
+            progress: ShutdownProgress = await self._require_tasks().withdraw_shutdown()
+            if progress["error"]:
+                self._update({"task_shutdown": progress, "exit_error": progress["error"]})
+                return
+            if self._task_exit is not None and not self._task_exit.done():
+                self._task_exit.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task_exit
+            self._update({"task_shutdown": progress, "exit_error": ""})
+
     async def _prepare_exit(self) -> bool:
         """先完成原生取消与最终事务，成功后桌面才关闭窗口。"""
         if self._exit_prepared:
@@ -1004,7 +1136,12 @@ class Runtime:
         asyncio.run_coroutine_threadsafe(self._command(command), self._loop).result()
 
     async def _command(self, command: str) -> None:
-        if command in DESKTOP_COMMANDS:
+        if command == "quit" and self._tasks is not None:
+            if self._task_exit is None or self._task_exit.done():
+                self._task_exit = asyncio.create_task(self._wait_for_task_exit(), name="task-exit")
+        elif command == "withdraw_task_exit":
+            await self._withdraw_task_exit()
+        elif command in DESKTOP_COMMANDS:
             self.events.put({"kind": "command", "command": command})
         elif command == "hide_floating":
             self._floating_preview = False
@@ -1143,13 +1280,18 @@ class Runtime:
             if not await self._prepare_exit():
                 raise RuntimeError(self._state["storage_error"])
         finally:
-            if self._task_projection is not None:
-                self._task_projection.cancel()
-                with suppress(asyncio.CancelledError):
-                    await self._task_projection
-            if self._tasks is not None:
-                await self._tasks.close()
-            await self._store.close()
-            self._views.clear()
-            await self._loop.shutdown_asyncgens()
-            await self._loop.shutdown_default_executor()
+            try:
+                for task in (self._task_exit, self._task_projection):
+                    if task is not None:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+            finally:
+                try:
+                    if self._tasks is not None:
+                        await self._tasks.close()
+                finally:
+                    await self._store.close()
+                    self._views.clear()
+                    await self._loop.shutdown_asyncgens()
+                    await self._loop.shutdown_default_executor()
