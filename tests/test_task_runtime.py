@@ -271,6 +271,54 @@ async def test_recovery_releases_old_resource_when_higher_priority_waiters_fill_
 
 
 @pytest.mark.asyncio
+async def test_resource_waiters_release_capacity_and_obey_limit_when_ready(owner):
+    store = TaskStore(owner)
+    batch = await store.dispatch(SOURCE, [
+        plan("recovery"), plan("b", priority=10), plan("c", priority=10),
+        plan("independent", scope=[{"operation": "window.show", "target": "other"}]),
+    ])
+    ids = {task["title"]: task["id"] for task in batch["tasks"]}
+    detail = await store.get_task(ids["recovery"])
+    detail["task"].update(state="cancelling", stop_intent="cancel", stop_reason="user", execution_id="old")
+    detail["executions"].append({"id": "old", "state": "running"})
+    detail["steps"].append({"id": "old-step", "execution_id": "old", "status": "started", "outcome": None, "request": action()})
+    await store.save_task(detail, [])
+    entered = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def worker(execution):
+        independent = execution.task_id == ids["independent"]
+        step = await execution.start_action(action(target="other" if independent else "main"))
+        entered.put_nowait(execution.task_id)
+        if independent:
+            await release.wait()
+        await execution.finish_action(step, outcome())
+        await execution.complete("已完成")
+
+    runtime = TaskRuntime(owner, worker, uncertain)
+    await runtime.start()
+    try:
+        recovery = await state(runtime, ids["recovery"], "waiting_user")
+        assert await asyncio.wait_for(entered.get(), 1) == ids["independent"]
+        assert (await runtime.get_task(ids["independent"]))["task"]["progress"] == "正在执行工具：show"
+        for name in ("b", "c"):
+            assert (await runtime.get_task(ids[name]))["task"]["progress"] == "等待本机资源"
+        await runtime.apply_concurrency(1)
+        await runtime.task_command(ids["recovery"], "answer", {
+            "question_id": recovery["questions"][0]["id"], "text": "结束旧步骤", "resolution": "cancelled",
+        })
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(entered.get(), 0.05)
+        release.set()
+        assert {await asyncio.wait_for(entered.get(), 2) for _ in range(2)} == {ids["b"], ids["c"]}
+        for name in ("independent", "b", "c"):
+            await state(runtime, ids[name], "completed")
+    finally:
+        release.set()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_successful_action_write_failure_retains_fact_and_retry_does_not_repeat(owner, monkeypatch):
     executed = []
     original = TaskStore.save_task

@@ -32,7 +32,7 @@ class TaskRuntime:
         self._on_change = on_change
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
-        self._resources_changed = asyncio.Event()
+        self._availability_changed = asyncio.Event()
         self._resources: dict[str, str] = {}
         self._running: dict[str, _Execution] = {}
         self._faults: dict[str, TaskDetail] = {}
@@ -130,7 +130,7 @@ class TaskRuntime:
     async def apply_concurrency(self, limit):
         async with self._lock:
             result = await self._store.apply_concurrency(limit)
-            self._wake.set()
+            self._signal_availability()
             return result
 
     async def get_concurrency(self):
@@ -293,8 +293,8 @@ class TaskRuntime:
                     task = detail["task"]
                     if task["id"] in self._running or task["id"] in self._faults or task["state"] not in {"queued", "recovering"}:
                         continue
-                    # 核对须先释放旧资源，才能让已占名额的资源等待者继续。
-                    if len(self._running) >= limit:
+                    # 核对可以先释放旧资源，再按并发上限安排后续执行。
+                    if self._active_count() >= limit:
                         needs_inspection = task["state"] == "recovering" and any(
                             step["status"] in {"started", "uncertain"} for step in detail["steps"])
                         if not needs_inspection:
@@ -356,7 +356,7 @@ class TaskRuntime:
                     pass
                 finally:
                     self._running.pop(execution.task_id)
-                    self._wake.set()
+                    self._signal_availability()
 
     async def _finish_stopped(self, execution):
         async with self._lock:
@@ -385,7 +385,7 @@ class TaskRuntime:
                 detail["task"]["state"] = "cancelled" if detail["task"]["stop_intent"] == "cancel" else "paused"
                 await self._commit(detail, [{"kind": "state", "text": "已完成停止请求"}])
                 return False
-            if len(self._running) > await self._store.get_concurrency():
+            if self._active_count() > await self._store.get_concurrency():
                 detail["task"].update(state="queued", progress="核对完成，等待执行名额")
                 await self._commit(detail, [{"kind": "state", "text": detail["task"]["progress"]}])
                 return False
@@ -415,7 +415,11 @@ class TaskRuntime:
                     raise PermissionError("工具目标超出用户确认的任务范围。")
                 if execution.model_call_id is not None and execution.pending_inputs(detail):
                     raise ValueError("新的任务输入已保存，请采用补充后重新安排动作。")
-                if not any(resource in self._resources for resource in request["resources"]):
+                resources_available = all(resource not in self._resources for resource in request["resources"])
+                if resources_available and (
+                    not execution.waiting_resources or self._active_count() < await self._store.get_concurrency()
+                ):
+                    execution.waiting_resources = False
                     step = {"id": uuid4().hex, "execution_id": execution.execution_id, "request": deepcopy(request),
                             "status": "started", "outcome": None, "final": execution.final_step,
                             "model_call_id": execution.model_call_id,
@@ -423,23 +427,39 @@ class TaskRuntime:
                     if execution.protocol_request_id is not None:
                         step["request"]["request_id"] = execution.protocol_request_id
                     detail["steps"].append(step)
+                    task["progress"] = f"正在执行工具：{request['tool']}"
                     # 步骤记录与资源占用在取消屏蔽区提交，工具返回许可后才开始真实动作。
                     with anyio.CancelScope(shield=True):
-                        await self._commit(detail, [{"kind": "state", "text": f"执行工具：{request['tool']}", "step_id": step["id"]}])
+                        await self._commit(detail, [{"kind": "state", "text": task["progress"], "step_id": step["id"]}])
                         for resource in request["resources"]:
                             self._resources[resource] = step["id"]
                         execution.current_step = step
                         execution.settled.clear()
                     return step["id"]
-                changed = self._resources_changed
+                if not execution.waiting_resources:
+                    execution.waiting_resources = True
+                    task["progress"] = "等待本机资源"
+                    await self._commit(detail, [{"kind": "state", "text": task["progress"]}])
+                    self._signal_availability()
+                changed = self._availability_changed
             await changed.wait()
 
+    def _active_count(self):
+        return sum(1 for execution in self._running.values() if not execution.waiting_resources)
+
+    def _signal_availability(self):
+        self._availability_changed.set()
+        self._availability_changed = asyncio.Event()
+        self._wake.set()
+
     def _release_resources(self, step):
+        released = False
         for resource in step["request"]["resources"]:
             if self._resources.get(resource) == step["id"]:
                 del self._resources[resource]
-        self._resources_changed.set()
-        self._resources_changed = asyncio.Event()
+                released = True
+        if released:
+            self._signal_availability()
 
     async def _finish_action(self, execution, step_id, outcome: ActionResult):
         async with self._lock:
@@ -459,7 +479,10 @@ class TaskRuntime:
             if outcome["status"] == "uncertain":
                 await self._question(detail, execution.execution_id, "无法确定上次动作结果，请确认该步骤已完成、未执行或已停止。", step_id)
             else:
-                await self._commit(detail, [{"kind": "state", "text": f"工具实际结果：{outcome['status']}", "step_id": step_id}])
+                text = f"工具实际结果：{outcome['status']}"
+                if detail["task"]["state"] == "running":
+                    detail["task"]["progress"] = text
+                await self._commit(detail, [{"kind": "state", "text": text, "step_id": step_id}])
                 self._release_resources(step)
             if execution.current_step is not None and execution.current_step["id"] == step_id:
                 execution.current_step.update(status=outcome["status"], outcome=outcome)
@@ -581,6 +604,7 @@ class _Execution:
         self.model_call_id = None
         self.recovering_steps = set()
         self.stop_requested = False
+        self.waiting_resources = False
         self.settled = asyncio.Event()
         self.settled.set()
         self.task: asyncio.Task
