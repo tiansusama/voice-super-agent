@@ -10,6 +10,7 @@ from voice_super_agent.desktop.host import DesktopApi
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.runtime import Runtime
 from voice_super_agent.tasks.mcp_client import MCPExecutionClient
+from voice_super_agent.tasks.recovery import ActionReconciler
 from voice_super_agent.tasks.runtime import TaskRuntime
 from voice_super_agent.tasks.store import TaskStore
 from voice_super_agent.tasks.worker import TaskWorker
@@ -150,7 +151,7 @@ def test_quit_waits_for_the_action_and_can_be_withdrawn(tmp_path):
 
     task_id = asyncio.run(seed())
     runtime = Runtime(database_path=path, task_factory=lambda store, on_change: TaskRuntime(
-        store, worker, tools.reconcile_action, on_change=on_change,
+        store, worker, ActionReconciler(tools.inspect_action), on_change=on_change,
     ))
     runtime.start()
     try:
@@ -283,7 +284,7 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
     def new_runtime():
         return Runtime(database_path=tmp_path / "desktop.sqlite3",
                        task_factory=lambda store, on_change: TaskRuntime(
-                           store, worker, tools.reconcile_action, on_change=on_change,
+                           store, worker, ActionReconciler(tools.inspect_action), on_change=on_change,
                        ))
 
     async def wait_for_failed_reply(reply_id):
@@ -437,7 +438,7 @@ def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
     task_id = asyncio.run(seed())
     worker = TaskWorker(tools.create_server, completion=model)
     runtime = Runtime(database_path=database, task_factory=lambda store, on_change: TaskRuntime(
-        store, worker, tools.reconcile_action, on_change=on_change,
+        store, worker, ActionReconciler(tools.inspect_action), on_change=on_change,
     ))
     runtime.start()
     try:

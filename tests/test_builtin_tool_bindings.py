@@ -4,6 +4,7 @@ import os
 import pytest
 
 from voice_super_agent.tasks.mcp_client import MCPExecutionClient
+from voice_super_agent.tasks.recovery import ActionReconciler
 from voice_super_agent.tooling.interface import BuiltinTools
 
 
@@ -57,12 +58,13 @@ async def test_recovery_observes_existing_file_without_claiming_ownership(tmp_pa
     observed = await tools.inspect_action(request)
     assert observed == {"path": str(path), "exists": True}
     assert Path(observed["path"]).read_text(encoding="utf-8") == "保留已有内容"
-    outcome = await tools.reconcile_action(RecordingAccess(), {"request": request})
+    reconcile = ActionReconciler(tools.inspect_action)
+    outcome = await reconcile(RecordingAccess(), {"request": request})
     assert outcome["status"] == "uncertain" and "归属" in outcome["error"]
     assert outcome["artifacts"] == []
     path.unlink()
     assert await tools.inspect_action(request) == {"path": str(path), "exists": False}
-    outcome = await tools.reconcile_action(RecordingAccess(), {"request": request})
+    outcome = await reconcile(RecordingAccess(), {"request": request})
     assert outcome["status"] == "not_executed"
 
 
@@ -74,10 +76,11 @@ async def test_recovery_records_the_actual_main_window_state():
     tools = BuiltinTools(applications=None, get_window_visibility=is_visible)
     show = {"request": {"operation": "window.show", "target": "main", "expected": {"visible": True}}}
     hide = {"request": {"operation": "window.hide", "target": "main", "expected": {"visible": False}}}
-    observed = await tools.reconcile_action(RecordingAccess(), show)
-    assert observed["status"] == "succeeded" and observed["result"]["visible"] is True
-    pending = await tools.reconcile_action(RecordingAccess(), hide)
-    assert pending["status"] == "not_executed" and pending["result"]["visible"] is True
+    reconcile = ActionReconciler(tools.inspect_action)
+    observed = await reconcile(RecordingAccess(), show)
+    assert observed["status"] == "succeeded" and observed["result"]["current_observation"]["visible"] is True
+    pending = await reconcile(RecordingAccess(), hide)
+    assert pending["status"] == "not_executed" and pending["result"]["current_observation"]["visible"] is True
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 的目录联接")

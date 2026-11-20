@@ -46,10 +46,20 @@ class TaskRuntime:
             await self._store.set_shutdown(False)
             for detail in await self._store.load_unfinished():
                 task = detail["task"]
+                confirmed_artifacts = []
+                uncertain_artifacts = []
                 for step in detail["steps"]:
+                    if step["status"] == "succeeded":
+                        confirmed_artifacts.extend(step["outcome"]["artifacts"])
+                    elif step["status"] == "uncertain" and step["outcome"] is not None:
+                        uncertain_artifacts.extend(step["outcome"]["artifacts"])
                     if step["status"] in {"started", "uncertain"}:
                         for resource in step["request"]["resources"]:
                             self._resources[resource] = step["id"]
+                artifacts = [artifact for artifact in detail["artifacts"]
+                             if artifact not in uncertain_artifacts or artifact in confirmed_artifacts]
+                artifacts_changed = artifacts != detail["artifacts"]
+                detail["artifacts"] = artifacts
                 if task["state"] in {"running", "pausing", "cancelling", "recovering", "storage_error"} or task["stop_reason"] == "shutdown":
                     for record in detail["executions"]:
                         if record["state"] == "running":
@@ -58,6 +68,8 @@ class TaskRuntime:
                     if task["stop_reason"] == "shutdown":
                         task["stop_reason"] = None
                     await self._commit(detail, [{"kind": "state", "text": task["progress"]}])
+                elif artifacts_changed:
+                    await self._commit(detail, [])
             self._dispatcher = asyncio.create_task(self._schedule(), name="task-dispatcher")
             self._wake.set()
 
@@ -205,8 +217,17 @@ class TaskRuntime:
                         resolution = payload.get("resolution")
                         if resolution not in {"succeeded", "not_executed", "cancelled"}:
                             raise ValueError("请明确确认原步骤已完成、未执行或已停止。")
+                        result = {"user_confirmation": text}
+                        artifacts = []
+                        if resolution == "succeeded" and step["request"]["operation"] == "file.create":
+                            path = step["request"]["target"]
+                            artifact = {"kind": "file", "path": path}
+                            result["path"] = path
+                            artifacts.append(artifact)
+                            if artifact not in detail["artifacts"]:
+                                detail["artifacts"].append(artifact)
                         step.update(status=resolution, confirmed_by=source, confirmation=text, previous_outcome=step["outcome"],
-                                    outcome={"status": resolution, "result": {"user_confirmation": text}, "artifacts": [], "error": ""})
+                                    outcome={"status": resolution, "result": result, "artifacts": artifacts, "error": ""})
                         resolved_step = step
                     question.update(status="answered", answer=text, answer_source=source)
                     item["question_id"] = question["id"]
@@ -431,9 +452,10 @@ class TaskRuntime:
             if step.get("outcome") == outcome and outcome["status"] != "uncertain":
                 return
             step.update(status=outcome["status"], outcome=deepcopy(outcome), finished_at=datetime.now(timezone.utc).isoformat())
-            for artifact in outcome["artifacts"]:
-                if artifact not in detail["artifacts"]:
-                    detail["artifacts"].append(artifact)
+            if outcome["status"] == "succeeded":
+                for artifact in outcome["artifacts"]:
+                    if artifact not in detail["artifacts"]:
+                        detail["artifacts"].append(artifact)
             if outcome["status"] == "uncertain":
                 await self._question(detail, execution.execution_id, "无法确定上次动作结果，请确认该步骤已完成、未执行或已停止。", step_id)
             else:

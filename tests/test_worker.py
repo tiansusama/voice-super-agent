@@ -367,6 +367,8 @@ async def test_restart_after_unrecorded_file_publish_waits_confirmation_and_othe
         await state(runtime, independent_id, "completed")
         assert requests == ["独立", "独立"]
         assert existing.read_text(encoding="utf-8") == "原内容"
+        assert detail["artifacts"] == []
+        assert detail["steps"][0]["outcome"]["result"]["current_observation"]["exists"] is True
         question = detail["questions"][0]
         with pytest.raises(ValueError, match="明确确认"):
             await runtime.task_command(old_id, "answer", {"question_id": question["id"], "text": "我看到了"})
@@ -374,6 +376,7 @@ async def test_restart_after_unrecorded_file_publish_waits_confirmation_and_othe
                                                        "resolution": "succeeded"})
         detail = await state(runtime, old_id, "completed")
         assert len(detail["steps"]) == 1
+        assert detail["artifacts"] == [{"kind": "file", "path": str(existing)}]
         assert existing.read_text(encoding="utf-8") == "原内容"
     finally:
         await runtime.close()
