@@ -4,6 +4,7 @@ version = "1.0.0.dev0"
 description = "运行于 Windows 的常驻语音 Agent"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "mcp==1.27.0",
     "onnxruntime==1.31.1",
     "pipecat-ai[local]",
     "pycaw==20251023",

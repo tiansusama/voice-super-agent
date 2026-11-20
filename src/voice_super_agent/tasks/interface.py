@@ -110,6 +110,7 @@ class ActionRequest(TypedDict):
     resources: list[str]
     cancellable: bool
     expected: dict
+    request_id: NotRequired[str | int]
 
 
 class ActionResult(TypedDict):
