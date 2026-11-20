@@ -55,6 +55,7 @@ interface DesktopSnapshot {
     exit_error: string;
     task_revision?: number;
     task_concurrency?: number | null;
+    task_shutdown?: { requested: boolean; ready: boolean; waiting: { task_id: string; title?: string; step_id?: string; tool?: string }[]; error: string } | null;
   };
 }
 

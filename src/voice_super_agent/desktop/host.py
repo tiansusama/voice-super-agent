@@ -270,8 +270,8 @@ class Desktop:
         return self._main_is_visible()
 
     def _handle_command(self, command: str) -> bool:
-        if command == "quit":
-            if not self.runtime.prepare_exit():
+        if command in {"quit", "quit_ready"}:
+            if command == "quit" and not self.runtime.prepare_exit():
                 self.activate()
                 return True
             self._quitting = True

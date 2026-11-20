@@ -17,7 +17,8 @@ from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.task_tools import confirmed_scope, validate_task_arguments
 from voice_super_agent.tasks.interface import (
-    TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage, TaskService, TaskSource, TaskSummary,
+    ShutdownProgress, TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage,
+    TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
@@ -69,6 +70,8 @@ class Runtime:
         self._tasks: TaskService | None = None
         self._task_reply_id: str | None = None
         self._task_projection: asyncio.Task | None = None
+        self._task_exit: asyncio.Task | None = None
+        self._task_exit_lock = asyncio.Lock()
         self._task_changes = asyncio.Event()
         self._task_position = 0
         self._task_cards: dict[str, TaskSummary] = {}
@@ -128,6 +131,7 @@ class Runtime:
             "exit_error": "",
             "task_revision": 0,
             "task_concurrency": None,
+            "task_shutdown": None,
         }
 
     def start(self) -> None:
@@ -963,6 +967,48 @@ class Runtime:
     def prepare_exit(self) -> bool:
         return asyncio.run_coroutine_threadsafe(self._prepare_exit(), self._loop).result()
 
+    async def _wait_for_task_exit(self) -> None:
+        tasks = self._require_tasks()
+        self._update({"exit_error": ""})
+        waiting_visible = False
+        try:
+            while True:
+                async with self._task_exit_lock:
+                    progress = await tasks.request_shutdown()
+                    if progress != self._state["task_shutdown"]:
+                        self._update({"task_shutdown": progress})
+                    if progress["error"]:
+                        self._update({"exit_error": progress["error"]})
+                        self.events.put({"kind": "command", "command": "show_main"})
+                        return
+                    if progress["ready"]:
+                        if await self._prepare_exit():
+                            self.events.put({"kind": "command", "command": "quit_ready"})
+                        else:
+                            self.events.put({"kind": "command", "command": "show_main"})
+                        return
+                    if not waiting_visible:
+                        self.events.put({"kind": "command", "command": "show_main"})
+                        waiting_visible = True
+                await asyncio.sleep(0.15)
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            self._update({"exit_error": f"保存任务退出状态失败：{exc}"})
+            self.events.put({"kind": "command", "command": "show_main"})
+
+    async def _withdraw_task_exit(self) -> None:
+        async with self._task_exit_lock:
+            if self._exit_prepared:
+                raise ValueError("应用正在关闭。")
+            progress: ShutdownProgress = await self._require_tasks().withdraw_shutdown()
+            if progress["error"]:
+                self._update({"task_shutdown": progress, "exit_error": progress["error"]})
+                return
+            if self._task_exit is not None and not self._task_exit.done():
+                self._task_exit.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task_exit
+            self._update({"task_shutdown": progress, "exit_error": ""})
+
     async def _prepare_exit(self) -> bool:
         """先完成原生取消与最终事务，成功后桌面才关闭窗口。"""
         if self._exit_prepared:
@@ -1004,7 +1050,12 @@ class Runtime:
         asyncio.run_coroutine_threadsafe(self._command(command), self._loop).result()
 
     async def _command(self, command: str) -> None:
-        if command in DESKTOP_COMMANDS:
+        if command == "quit" and self._tasks is not None:
+            if self._task_exit is None or self._task_exit.done():
+                self._task_exit = asyncio.create_task(self._wait_for_task_exit(), name="task-exit")
+        elif command == "withdraw_task_exit":
+            await self._withdraw_task_exit()
+        elif command in DESKTOP_COMMANDS:
             self.events.put({"kind": "command", "command": command})
         elif command == "hide_floating":
             self._floating_preview = False
@@ -1143,6 +1194,10 @@ class Runtime:
             if not await self._prepare_exit():
                 raise RuntimeError(self._state["storage_error"])
         finally:
+            if self._task_exit is not None and not self._task_exit.done():
+                self._task_exit.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task_exit
             if self._task_projection is not None:
                 self._task_projection.cancel()
                 with suppress(asyncio.CancelledError):

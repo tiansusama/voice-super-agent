@@ -20,6 +20,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   const state = snapshot.state;
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
   const tasksAvailable = state.task_concurrency != null;
+  const waitingForExit = state.task_shutdown?.requested && !state.exiting;
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
   const canOperate = !state.exiting && !state.restarting && !state.storage_error && !state.exit_error;
   const canSend = state.model_available && canOperate && !voiceSwitching;
@@ -157,6 +158,13 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
           {state.storage_error && <div className="notice warning" role="alert"><p>{state.storage_error}</p></div>}
           {state.exit_error && <div className="notice warning" role="alert"><p>{state.exit_error}</p>
             <button className="notice-action" onClick={() => void command('quit')} disabled={state.exiting}>再次退出</button></div>}
+          {waitingForExit && <div className="notice" role="status">
+            <div><p>等待当前步骤完成后退出</p>
+              {state.task_shutdown!.waiting.map((step, index) =>
+                <p key={step.step_id ?? `${step.task_id}-${index}`}>{step.title ?? step.task_id}{step.tool && ` · ${step.tool}`}</p>)}
+            </div>
+            <button className="notice-action" onClick={() => void command('withdraw_task_exit')}>撤回退出</button>
+          </div>}
           {state.voice_recovery === 'running' && <div className="notice" role="status">正在恢复语音…</div>}
           {state.voice_recovery === 'succeeded' && state.voice_status === 'standby' &&
             <div className="notice" role="status"><Check size={16} />语音已恢复，等待再次唤醒。</div>}

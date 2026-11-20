@@ -1,5 +1,6 @@
 import asyncio
 import json
+from threading import Event
 
 from aiohttp import web
 import pytest
@@ -105,6 +106,49 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
                 api.mark_task_read(notification["id"])
         finally:
             runtime.stop()
+
+
+def test_quit_waits_for_the_action_and_can_be_withdrawn():
+    action_finished = Event()
+
+    class TaskService:
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def get_concurrency(self):
+            return 2
+
+        async def list_changes(self, after_position, limit):
+            return []
+
+        async def request_shutdown(self):
+            ready = action_finished.is_set()
+            return {"requested": True, "ready": ready, "error": "",
+                    "waiting": [] if ready else [{"task_id": "task", "step_id": "step", "title": "生成清单"}]}
+
+        async def withdraw_shutdown(self):
+            return {"requested": False, "ready": False, "waiting": [], "error": ""}
+
+    runtime = Runtime(task_factory=lambda store, notify: TaskService())
+    runtime.start()
+    try:
+        api = DesktopApi(runtime, "main")
+        api.command("quit")
+        while (event := runtime.events.get(timeout=3)).get("command") != "show_main":
+            assert event.get("command") != "quit_ready"
+        assert api.connect()["state"]["task_shutdown"]["waiting"][0]["step_id"] == "step"
+        api.command("withdraw_task_exit")
+        assert not api.connect()["state"]["task_shutdown"]["requested"]
+        action_finished.set()
+        api.command("quit")
+        while runtime.events.get(timeout=3).get("command") != "quit_ready":
+            pass
+        assert api.connect()["state"]["exiting"]
+    finally:
+        runtime.stop()
 
 
 @pytest.mark.asyncio
