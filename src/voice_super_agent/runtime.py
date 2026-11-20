@@ -68,6 +68,12 @@ class Runtime:
         self._task_factory = task_factory
         self._tasks: TaskService | None = None
         self._task_reply_id: str | None = None
+        self._task_projection: asyncio.Task | None = None
+        self._task_changes = asyncio.Event()
+        self._task_position = 0
+        self._task_cards: dict[str, TaskSummary] = {}
+        self._task_notices: dict[str, TaskChange] = {}
+        self._task_questions: dict[str, dict] = {}
         self._storage_ready = False
         self._revision = 0
         self._saved_revision = 0
@@ -170,6 +176,8 @@ class Runtime:
         if self._task_factory is not None:
             self._tasks = self._task_factory(self._store, self._task_changed)
             await self._tasks.start()
+            await self._project_task_changes()
+            self._task_projection = asyncio.create_task(self._watch_task_changes(), name="task-notifications")
             self._update({"task_concurrency": await self._tasks.get_concurrency()})
         logger.info("已恢复 %s 条展示消息、%s 条原生模型消息", len(self._messages), len(self._model_records))
         self._idle_task = asyncio.create_task(self._watch_idle(), name="voice-idle")
@@ -213,11 +221,49 @@ class Runtime:
         self.events.put({"kind": "state", "views": tuple(self._views), "snapshot": self._snapshot()})
 
     def _snapshot(self) -> dict[str, Any]:
+        messages = [dict(message) for message in self._messages.values()][self._window["display_start_position"]:]
+        visible = {message["id"] for message in messages}
+        for message in messages:
+            notice = self._task_notices.get(message["id"])
+            if notice is not None:
+                message["task_notice"] = {**notice, "question": self._task_questions.get(notice["question_id"])}
         return {"sequence": self._sequence, "state": dict(self._state),
-                "messages": [dict(message) for message in self._messages.values()][self._window["display_start_position"]:]}
+                "messages": messages, "task_cards": [dict(task) for task in self._task_cards.values()
+                                                      if task["source"]["message_id"] in visible]}
 
     async def _task_changed(self, change: TaskChange) -> None:
-        self._update({"task_revision": self._state["task_revision"] + 1})
+        self._task_changes.set()
+
+    async def _watch_task_changes(self) -> None:
+        while True:
+            await self._task_changes.wait()
+            self._task_changes.clear()
+            await self._project_task_changes()
+
+    async def _project_task_changes(self) -> None:
+        tasks = self._require_tasks()
+        projected = False
+        while batch := await tasks.list_changes(self._task_position, 100):
+            details = {task_id: await tasks.get_task(task_id) for task_id in dict.fromkeys(change["task_id"] for change in batch)}
+            for task_id, detail in details.items():
+                self._task_cards[task_id] = detail["task"]
+                self._task_questions.update((question["id"], question) for question in detail["questions"])
+            for change in batch:
+                if change["kind"] in {"question", "result", "error"}:
+                    message_id = f'task-{change["id"]}'
+                    self._task_notices[message_id] = change
+                    if message_id not in self._messages:
+                        task = details[change["task_id"]]["task"]
+                        self._messages[message_id] = {
+                            "id": message_id, "role": "assistant", "source": change["source"], "reply_id": message_id,
+                            "text": f'{task["title"]} · {change["text"]}', "status": "completed",
+                            "created_at": change["created_at"], "error": "",
+                        }
+                        self._request_save(immediate=True)
+                self._task_position = change["position"]
+                projected = True
+        if projected:
+            self._update({"task_revision": self._state["task_revision"] + 1})
 
     def _require_tasks(self) -> TaskService:
         if self._tasks is None:
@@ -235,8 +281,22 @@ class Runtime:
 
     async def _task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
         result = await self._require_tasks().task_command(task_id, action, payload)
+        self._task_cards[task_id] = result
+        self._task_changes.set()
         self._update({"task_revision": self._state["task_revision"] + 1})
         return result
+
+    def mark_task_read(self, notification_id: str) -> None:
+        asyncio.run_coroutine_threadsafe(self._mark_task_read(notification_id), self._loop).result()
+
+    async def _mark_task_read(self, notification_id: str) -> None:
+        tasks = self._require_tasks()
+        notice = self._task_notices[f"task-{notification_id}"]
+        await tasks.mark_read(notification_id)
+        self._task_notices[f"task-{notification_id}"] = {**notice, "read": True}
+        detail = await tasks.get_task(notice["task_id"])
+        self._task_cards[notice["task_id"]] = detail["task"]
+        self._update({"task_revision": self._state["task_revision"] + 1})
 
     def save_task_concurrency(self, limit: int) -> int:
         return asyncio.run_coroutine_threadsafe(self._save_task_concurrency(limit), self._loop).result()
@@ -287,7 +347,7 @@ class Runtime:
         self._task_source(reply_id)
         if name == "dispatch_tasks":
             batch = await asyncio.shield(tasks.dispatch(source, plans))
-            self._update({"task_revision": self._state["task_revision"] + 1})
+            self._task_changes.set()
             return batch
         result = await asyncio.shield(self._task_command(arguments["task_id"], arguments["action"], payload))
         return {"task": result}
@@ -1083,6 +1143,10 @@ class Runtime:
             if not await self._prepare_exit():
                 raise RuntimeError(self._state["storage_error"])
         finally:
+            if self._task_projection is not None:
+                self._task_projection.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task_projection
             if self._tasks is not None:
                 await self._tasks.close()
             await self._store.close()

@@ -12,3 +12,6 @@
 .task-detail li { overflow-wrap: anywhere; }
 .task-answer label, .task-answer textarea { display: block; margin-bottom: 8px; }
 .task-answer textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fffdfb; color: var(--ink); font: inherit; resize: vertical; }
+.message .task-card { margin-top: 8px; }
+.task-notice { margin-top: 8px; }
+.task-notice .task-answer { margin-top: 8px; }

@@ -68,6 +68,9 @@ class DesktopApi:
     def save_task_concurrency(self, limit: int):
         return self._runtime.save_task_concurrency(limit)
 
+    def mark_task_read(self, notification_id: str):
+        self._runtime.mark_task_read(notification_id)
+
     def floating_layout(self, card_height: float, controls_visible: bool, hint_visible: bool) -> None:
         self._runtime.update_windows(floating_card_height=ceil(card_height),
                                      floating_controls_visible=controls_visible, floating_hint_visible=hint_visible)

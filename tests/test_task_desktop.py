@@ -5,6 +5,7 @@ from aiohttp import web
 import pytest
 
 from voice_super_agent.desktop.host import DesktopApi
+from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.runtime import Runtime
 from voice_super_agent.tasks.store import TaskStore
 
@@ -29,13 +30,16 @@ def test_desktop_task_operations_share_the_runtime_state():
             assert (cursor, limit) == (9, 20)
             return {"tasks": [{"id": "task", "state": self.state}], "next_cursor": None}
 
+        async def list_changes(self, after_position, limit):
+            return []
+
         async def get_task(self, task_id):
             return {"task": {"id": task_id, "state": self.state}}
 
         async def task_command(self, task_id, action, payload):
             assert (task_id, action, payload) == ("task", "answer", {"question_id": "question", "text": "确认"})
             self.state = "queued"
-            return {"id": task_id, "state": self.state}
+            return {"id": task_id, "state": self.state, "source": {"message_id": "message"}}
 
     tasks = TaskService()
     runtime = Runtime(task_factory=lambda store, notify: tasks)
@@ -54,6 +58,53 @@ def test_desktop_task_operations_share_the_runtime_state():
     finally:
         runtime.stop()
     assert tasks.state == "closed"
+
+
+def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
+    class TaskService(TaskStore):
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+    path = tmp_path / "tasks.sqlite3"
+
+    async def seed():
+        store = ConversationStore(path)
+        await store.open()
+        try:
+            source = {"message_id": "ask", "reply_id": "reply", "source": "voice"}
+            await store.save([{
+                "id": "ask", "role": "user", "source": "voice", "reply_id": "reply", "text": "显示小博",
+                "status": "completed", "created_at": "2026-11-20T03:00:00+00:00", "error": "",
+            }], [], {"display_start_position": 1, "model_start_position": 0})
+            tasks = TaskStore(store)
+            batch = await tasks.dispatch(source, [{
+                "key": "show", "title": "显示窗口", "goal": "显示小博",
+                "scope": [{"operation": "window.show", "target": "main"}],
+            }])
+            detail = await tasks.get_task(batch["tasks"][0]["id"])
+            detail["task"].update(state="completed", progress="", result="主窗口已显示", actions=[])
+            notification, = await tasks.save_task(detail, [{"kind": "result", "text": "主窗口已显示"}])
+            return notification
+        finally:
+            await store.close()
+
+    notification = asyncio.run(seed())
+    for reopened in (False, True):
+        runtime = Runtime(database_path=path, task_factory=lambda store, notify: TaskService(store))
+        runtime.start()
+        try:
+            api = DesktopApi(runtime, "main")
+            message, = api.connect()["messages"]
+            assert message["text"] == "显示窗口 · 主窗口已显示"
+            assert message["task_notice"]["id"] == notification["id"]
+            assert message["task_notice"]["read"] is reopened
+            if not reopened:
+                api.mark_task_read(notification["id"])
+        finally:
+            runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -104,6 +155,10 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
         task, = runtime.list_tasks()["tasks"]
         assert result["tasks"][0]["id"] == task["id"]
         assert task["source"] == {"message_id": accepted["user_message_id"], "reply_id": accepted["reply_id"], "source": "text"}
+        async with asyncio.timeout(5):
+            while not runtime.connect("main")["task_cards"]:
+                await asyncio.sleep(.01)
+        assert runtime.connect("main")["task_cards"][0]["id"] == task["id"]
 
         runtime.send_text("请告诉我还有哪些任务？")
         denied = await asyncio.wait_for(tool_results.get(), 5)

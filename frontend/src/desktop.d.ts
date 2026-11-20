@@ -1,6 +1,7 @@
 interface DesktopSnapshot {
   sequence: number;
   messages: ChatMessage[];
+  task_cards?: import('./TaskPanel').TaskSummary[];
   state: {
     status: 'ready';
     main_window: 'visible' | 'hidden' | 'minimized';
@@ -66,6 +67,7 @@ interface ChatMessage {
   status: 'queued' | 'thinking' | 'streaming' | 'completed' | 'interrupted' | 'failed' | 'unfinished' | 'backchannel';
   created_at: string;
   error: string;
+  task_notice?: import('./TaskPanel').TaskNotice;
 }
 
 interface DesktopConnection extends DesktopSnapshot {
@@ -108,6 +110,7 @@ interface Window {
       get_task?(task_id: string): Promise<import('./TaskPanel').TaskDetail>;
       task_command?: import('./TaskPanel').RunTaskAction;
       save_task_concurrency?(limit: number): Promise<number>;
+      mark_task_read?(notification_id: string): Promise<void>;
     };
   };
 }

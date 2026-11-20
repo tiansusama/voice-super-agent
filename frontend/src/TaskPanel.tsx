@@ -35,6 +35,13 @@ type TaskQuestion = {
   answer: string | null;
 };
 
+export type TaskNotice = {
+  id: string;
+  task_id: string;
+  read: boolean;
+  question: TaskQuestion | null;
+};
+
 export type TaskDetail = {
   task: TaskSummary;
   questions: TaskQuestion[];
@@ -84,7 +91,7 @@ export function TaskCard({ task, open, command }: {
   </article>;
 }
 
-function QuestionReply({ question, command }: { question: TaskQuestion; command: RunTaskAction }) {
+export function QuestionReply({ question, command }: { question: TaskQuestion; command: RunTaskAction }) {
   const [text, setText] = useState('');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');

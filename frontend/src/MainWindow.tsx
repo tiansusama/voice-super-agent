@@ -3,7 +3,7 @@ import { ArrowDown, AudioLines, Check, CircleStop, Clock3, CornerDownLeft, ListT
   MessageCircle, RotateCcw, SendHorizontal, Settings2, UserRound } from 'lucide-react';
 import { SettingsPanel } from './SettingsPanel';
 import { HistoryPanel } from './HistoryPanel';
-import { TaskConcurrencySetting, TaskPanel, type RunTaskAction } from './TaskPanel';
+import { QuestionReply, TaskCard, TaskConcurrencySetting, TaskPanel, type RunTaskAction, type TaskNotice } from './TaskPanel';
 import './settings-history.css';
 
 export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSnapshot; connectionError: string }) {
@@ -100,6 +100,16 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   const taskCommand: RunTaskAction = (taskId, action, payload) =>
     window.pywebview!.api.task_command!(taskId, action, payload);
 
+  async function openTaskNotice(notice: TaskNotice) {
+    try {
+      if (!notice.read) await window.pywebview!.api.mark_task_read!(notice.id);
+      setError('');
+      openTask(notice.task_id);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
   return (
     <div className="desktop-shell">
       <aside className="sidebar" aria-label="主导航">
@@ -175,6 +185,13 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
                 </div>
                 <div className="message-body">
                   {message.text && <div className="message-text">{message.text}</div>}
+                  {message.task_notice && <div className="task-notice">
+                    <button className="quiet-button" onClick={() => void openTaskNotice(message.task_notice!)}>
+                      查看任务{message.task_notice.read ? '' : ' · 未读'}
+                    </button>
+                    {message.task_notice.question?.status === 'open' &&
+                      <QuestionReply question={message.task_notice.question} command={taskCommand} />}
+                  </div>}
                   {message.status === 'queued' && <span className="message-progress">等待处理…</span>}
                   {state.history_reply_id === message.id && historyLabel &&
                     <span className="message-progress" role="status">{state.history_error || historyLabel}</span>}
@@ -184,6 +201,8 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
                     {message.role === 'user' ? '正在识别…' : '正在回复…'}</span>}
                   {message.error && <p className="message-error" role="alert">{message.error}</p>}
                 </div>
+                {snapshot.task_cards?.filter(task => task.source.message_id === message.id).map(task =>
+                  <TaskCard key={task.id} task={task} open={openTask} command={taskCommand} />)}
                 {message.role === 'user' && message.source === 'text' && failedReplies.has(message.reply_id) &&
                   <button className="resend-message" disabled={!canSend || sending} onClick={() => void sendText(message.id)}>
                     <RotateCcw size={13} />重新发送</button>}
