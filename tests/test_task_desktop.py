@@ -118,55 +118,64 @@ def test_saved_task_notification_is_recovered_once_and_marks_read(tmp_path):
             runtime.stop()
 
 
-def test_quit_waits_for_the_action_and_can_be_withdrawn():
+def test_quit_waits_for_the_action_and_can_be_withdrawn(tmp_path):
+    action_started = Event()
     action_finished = Event()
+    path = tmp_path / "quit.sqlite3"
 
-    class TaskService:
-        async def start(self):
-            pass
+    async def seed():
+        store = ConversationStore(path)
+        await store.open()
+        try:
+            await store.save([{
+                "id": "ask", "role": "user", "source": "text", "reply_id": "reply", "text": "隐藏小博",
+                "status": "completed", "created_at": "2026-11-20T03:00:00+00:00", "error": "",
+            }], [], {"display_start_position": 0, "model_start_position": 0})
+            batch = await TaskStore(store).dispatch({"message_id": "ask", "reply_id": "reply", "source": "text"}, [{
+                "key": "hide", "title": "隐藏小博", "goal": "隐藏小博",
+                "scope": [{"operation": "window.hide", "target": "main"}],
+            }])
+            return batch["tasks"][0]["id"]
+        finally:
+            await store.close()
 
-        async def close(self):
-            pass
+    async def set_visibility(visible):
+        action_started.set()
+        assert await asyncio.to_thread(action_finished.wait, 8)
+        return visible
 
-        async def get_concurrency(self):
-            return 2
+    tools = BuiltinTools(applications=None, set_window_visibility=set_visibility)
 
-        async def list_changes(self, after_position, limit):
-            return []
+    async def worker(execution):
+        detail = await execution.get_task()
+        async with MCPExecutionClient(tools.create_server(execution, detail["scope"])) as client:
+            await client.call_tool("set_main_window", {"operation": "hide"})
+        await execution.complete("主窗口已隐藏")
 
-        async def next_change(self):
-            await asyncio.Future()
-
-        async def request_shutdown(self):
-            ready = action_finished.is_set()
-            return {"requested": True, "ready": ready, "error": "",
-                    "waiting": [] if ready else [{"task_id": "task", "step_id": "step", "title": "生成清单"}]}
-
-        async def get_task(self, task_id):
-            assert task_id == "task"
-            return {"task": {"title": "生成清单"}, "steps": [{"id": "step", "request": {"tool": "create_text_file"}}]}
-
-        async def withdraw_shutdown(self):
-            return {"requested": False, "ready": False, "waiting": [], "error": ""}
-
-    runtime = Runtime(task_factory=lambda store: TaskService())
+    task_id = asyncio.run(seed())
+    runtime = Runtime(database_path=path, task_factory=lambda store: TaskRuntime(store, worker, tools.reconcile_action))
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
+        assert action_started.wait(5)
         api.command("quit")
         while (event := runtime.events.get(timeout=3)).get("command") != "show_main":
             assert event.get("command") != "quit_ready"
-        assert api.connect()["state"]["task_shutdown"]["waiting"][0] == {
-            "task_id": "task", "step_id": "step", "title": "生成清单", "tool": "create_text_file",
-        }
+        waiting = api.connect()["state"]["task_shutdown"]["waiting"][0]
+        assert waiting["task_id"] == task_id and waiting["step_id"]
+        assert (waiting["title"], waiting["tool"]) == ("隐藏小博", "set_main_window")
         api.command("withdraw_task_exit")
         assert not api.connect()["state"]["task_shutdown"]["requested"]
-        action_finished.set()
+        assert api.get_task(task_id)["task"]["state"] == "running"
         api.command("quit")
+        while (event := runtime.events.get(timeout=3)).get("command") != "show_main":
+            assert event.get("command") != "quit_ready"
+        action_finished.set()
         while runtime.events.get(timeout=3).get("command") != "quit_ready":
             pass
         assert api.connect()["state"]["exiting"]
     finally:
+        action_finished.set()
         runtime.stop()
 
 
