@@ -84,6 +84,7 @@ class TaskCommandPayload(TypedDict, total=False):
     text: str
     question_id: str
     scope: list[ScopeGrant]
+    resolution: Literal["succeeded", "not_executed", "cancelled"]
 
 
 class TaskDetail(TypedDict):
@@ -156,6 +157,15 @@ class ExecutionAccess(Protocol):
 TaskChangeHandler = Callable[[TaskChange], Awaitable[None]]
 
 
+class TaskRuntimeFault(TypedDict):
+    """写入失败时报告内存中的真实结果，区别于已经提交的持久通知。"""
+
+    kind: Literal["storage_error"]
+    task_id: str
+    error: str
+    known_result: ActionResult | None
+
+
 class TaskService(Protocol):
     """命令等待存储提交，长工具动作由独立 Worker 推进。"""
 
@@ -181,6 +191,8 @@ class TaskService(Protocol):
     async def list_changes(self, after_position: int = 0, limit: int = 50) -> list[TaskChange]: ...
 
     async def mark_read(self, notification_id: str) -> None: ...
+
+    async def next_change(self) -> TaskChange | TaskRuntimeFault: ...
 
     async def request_shutdown(self) -> ShutdownProgress: ...
 
