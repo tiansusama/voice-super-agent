@@ -158,6 +158,10 @@ class TaskStore:
             raise ValueError("通知游标须为非负整数，每页 1～100 条。")
         return await self._store.task_io(self._list_changes, after_position, limit)
 
+    async def last_change_position(self) -> int:
+        return await self._store.task_io(lambda connection: connection.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM task_notifications").fetchone()[0])
+
     def _list_changes(self, connection, after_position, limit):
         rows = connection.execute("SELECT n.*, b.source FROM task_notifications n JOIN task_records t ON t.id = n.task_id "
                                   "JOIN task_batches b ON b.source_message_id = t.source_message_id "
