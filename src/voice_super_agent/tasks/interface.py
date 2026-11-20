@@ -48,6 +48,8 @@ class TaskQuestion(TypedDict):
     status: Literal["open", "answered", "closed"]
     answer: str | None
     created_at: str
+    requested_operation: NotRequired[Literal["file.create"]]
+    replacement_for: NotRequired[str]
 
 
 class TaskSummary(TypedDict):

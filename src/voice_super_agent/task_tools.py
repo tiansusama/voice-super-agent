@@ -133,6 +133,14 @@ def confirm_step_resolution(user_answer: str, resolution: str | None) -> None:
         raise ValueError("请明确确认实际步骤已完成、未执行或已停止。")
 
 
+def replacement_file_scope(user_answer: str) -> ScopeGrant:
+    path = user_answer.strip()
+    if _QUOTED.fullmatch(path):
+        path = path[1:-1]
+    files = FileTools([FileGrant("create", path)])
+    return ScopeGrant(operation="file.create", target=str(files.approved_path("create", path)))
+
+
 def confirmed_scope(grants: list[ScopeGrant], user_text: str, resolve_application: Callable[[str], str]) -> list[ScopeGrant]:
     scopes = []
     for grant in grants:

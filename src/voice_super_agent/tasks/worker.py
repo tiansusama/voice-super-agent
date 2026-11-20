@@ -161,8 +161,10 @@ class TaskWorker:
                                     result = {"status": "superseded", "text": "请采用新补充后重新安排动作。"}
                                 elif current["task"]["state"] == "running" and current["steps"]:
                                     step = current["steps"][-1]
-                                    if step["request"]["operation"] == "file.create" and step["status"] == "not_executed":
-                                        await execution.ask(f"文件生成尚未执行：{step['outcome']['error']}。请确认新的路径或内容。")
+                                    if (step.get("model_call_id") == call["id"] and step["request"]["operation"] == "file.create"
+                                            and step["status"] == "not_executed"
+                                            and step["outcome"]["result"].get("reason") == "file_exists"):
+                                        await execution.ask(step["outcome"]["error"], replacement_for=step["request"]["target"])
                                         return
                                     raise
                                 else:

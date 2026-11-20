@@ -408,7 +408,6 @@ def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
     database, original, replacement = tmp_path / "task.sqlite3", tmp_path / "旧.txt", tmp_path / "新.txt"
     original.write_text("保留原文件", encoding="utf-8")
     tools = BuiltinTools(applications=None)
-    finished = Event()
 
     async def seed():
         owner = ConversationStore(database)
@@ -422,41 +421,40 @@ def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
             store = TaskStore(owner)
             result = await store.dispatch(source, [{"key": "report", "title": "生成报告", "goal": "创建文件",
                                                     "scope": [{"operation": "file.create", "target": str(original)}]}])
-            task_id = result["tasks"][0]["id"]
-            detail = await store.get_task(task_id)
-            detail["task"].update(state="waiting_user", actions=["answer"])
-            detail["questions"].append({"id": "replace", "task_id": task_id, "execution_id": None, "step_id": None,
-                                        "text": "目标文件已存在，请指定新的文件路径。", "status": "open", "answer": None,
-                                        "requested_operation": "file.create", "created_at": detail["task"]["created_at"]})
-            await store.save_task(detail, [{"kind": "question", "question_id": "replace", "text": "请指定新的文件路径。"}])
-            return task_id
+            return result["tasks"][0]["id"]
         finally:
             await owner.close()
 
-    async def worker(execution):
-        detail = await execution.get_task()
-        async with MCPExecutionClient(tools.create_server(execution, detail["scope"])) as client:
-            await client.call_tool("create_text_file", {"path": str(replacement), "content": "生成产物"})
-        await execution.complete("新文件已生成")
-        finished.set()
+    async def model(params):
+        if params["messages"][-1]["role"] == "tool":
+            return {"role": "assistant", "content": "新文件已生成"}
+        scope = json.loads(params["messages"][0]["content"].split("\n任务定义：\n", 1)[1])["scope"]
+        return {"role": "assistant", "tool_calls": [{"id": "write", "type": "function",
+                 "function": {"name": "create_text_file", "arguments": json.dumps({
+                     "path": scope[0]["target"], "content": "生成产物", "final_step": True,
+                 })}}]}
 
     task_id = asyncio.run(seed())
+    worker = TaskWorker(tools.create_server, completion=model)
     runtime = Runtime(database_path=database, task_factory=lambda store, on_change: TaskRuntime(
         store, worker, tools.reconcile_action, on_change=on_change,
     ))
     runtime.start()
     try:
         api = DesktopApi(runtime, "main")
+        while not any(task["state"] == "waiting_user" for task in runtime.events.get(timeout=3)["snapshot"]["task_cards"]):
+            pass
         question, = api.get_task(task_id)["questions"]
         assert question["requested_operation"] == "file.create"
         with pytest.raises(ValueError, match="本机绝对文件路径"):
             api.task_command(task_id, "answer", {"question_id": question["id"], "text": "相对路径.txt"})
         api.task_command(task_id, "answer", {"question_id": question["id"], "text": str(replacement)})
-        assert finished.wait(3)
+        while not any(task["state"] == "completed" for task in runtime.events.get(timeout=3)["snapshot"]["task_cards"]):
+            pass
         detail = api.get_task(task_id)
         assert detail["task"]["state"] == "completed"
         assert detail["questions"][0]["answer"] == str(replacement)
-        assert {"operation": "file.create", "target": str(replacement)} in detail["scope"]
+        assert detail["scope"] == [{"operation": "file.create", "target": str(replacement)}]
         assert replacement.read_text(encoding="utf-8") == "生成产物"
         assert original.read_text(encoding="utf-8") == "保留原文件"
     finally:

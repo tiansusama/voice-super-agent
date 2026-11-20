@@ -191,6 +191,15 @@ class TaskRuntime:
                     question = next((q for q in detail["questions"] if q["id"] == payload["question_id"] and q["status"] == "open"), None)
                     if question is None:
                         raise ValueError("答复必须对应此任务尚待回答的问题。")
+                    if question.get("requested_operation") == "file.create":
+                        replacement = payload.get("scope", [])
+                        if source is None or len(replacement) != 1 or replacement[0]["operation"] != "file.create":
+                            raise ValueError("请确认新的绝对文件路径。")
+                        previous = question["replacement_for"]
+                        if Path(replacement[0]["target"]) == Path(previous):
+                            raise ValueError("请指定不同的文件路径。")
+                        detail["scope"] = [grant for grant in detail["scope"]
+                                           if grant["operation"] != "file.create" or Path(grant["target"]) != Path(previous)]
                     if question["step_id"] is not None:
                         step = next(s for s in detail["steps"] if s["id"] == question["step_id"])
                         resolution = payload.get("resolution")
@@ -436,7 +445,7 @@ class TaskRuntime:
                 if detail["task"]["state"] in {"pausing", "cancelling"}:
                     self._stop_execution(execution)
 
-    async def _question(self, detail, execution_id, text, step_id=None):
+    async def _question(self, detail, execution_id, text, step_id=None, *, replacement_for=None):
         if step_id is not None and any(q["step_id"] == step_id and q["status"] == "open" for q in detail["questions"]):
             detail["task"].update(state="waiting_user", progress="等待用户答复")
             await self._commit(detail, [{"kind": "state", "text": "等待用户答复"}])
@@ -444,6 +453,8 @@ class TaskRuntime:
         question = {"id": uuid4().hex, "task_id": detail["task"]["id"], "execution_id": execution_id,
                     "step_id": step_id, "text": text, "status": "open", "answer": None,
                     "created_at": datetime.now(timezone.utc).isoformat()}
+        if replacement_for is not None:
+            question.update(requested_operation="file.create", replacement_for=replacement_for)
         detail["questions"].append(question)
         detail["task"].update(state="waiting_user", progress="等待用户答复")
         await self._commit(detail, [{"kind": "question", "text": text, "question_id": question["id"], "step_id": step_id}])
@@ -614,12 +625,12 @@ class _Execution:
         return {"id": identifier, "text": text[offset:end], "total_characters": len(text),
                 "next_offset": end if end < len(text) else None}
 
-    async def ask(self, text):
+    async def ask(self, text, *, replacement_for=None):
         async with self.runtime._lock:
             detail = await self.get_task()
             if detail["task"]["execution_id"] != self.execution_id or detail["task"]["state"] != "running":
                 raise asyncio.CancelledError()
-            await self.runtime._question(detail, self.execution_id, text)
+            await self.runtime._question(detail, self.execution_id, text, replacement_for=replacement_for)
 
     async def complete(self, text):
         return await self.runtime._complete(self, text)

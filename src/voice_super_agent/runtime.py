@@ -15,13 +15,14 @@ from websockets.exceptions import WebSocketException
 
 from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
-from voice_super_agent.task_tools import confirm_step_resolution, confirmed_scope, task_command_intent, validate_task_arguments
+from voice_super_agent.task_tools import (
+    confirm_step_resolution, confirmed_scope, replacement_file_scope, task_command_intent, validate_task_arguments,
+)
 from voice_super_agent.tasks.interface import (
     ShutdownProgress, TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail,
     TaskPage, TaskRuntimeFault, TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
-from voice_super_agent.tooling.files import FileGrant, FileTools
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.wake import KeywordDetector
@@ -337,9 +338,7 @@ class Runtime:
                 raise ValueError("答复必须对应此任务尚待回答的问题。")
             if question.get("requested_operation") == "file.create":
                 new_path = answer["text"].strip()
-                target = str(await asyncio.to_thread(
-                    lambda: FileTools([FileGrant("create", new_path)]).approved_path("create", new_path),
-                ))
+                scope = await asyncio.to_thread(replacement_file_scope, new_path)
                 message_id = uuid4().hex
                 source = TaskSource(message_id=message_id, reply_id=message_id, source="text")
                 self._messages[message_id] = {
@@ -350,7 +349,7 @@ class Runtime:
                 self._request_save(immediate=True)
                 if not await asyncio.shield(self._flush()):
                     raise ValueError(self._state["storage_error"])
-                answer.update(text=new_path, source=source, scope=[{"operation": "file.create", "target": target}])
+                answer.update(text=new_path, source=source, scope=[scope])
         return await self._task_command(task_id, action, answer or None)
 
     async def _task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
@@ -432,7 +431,9 @@ class Runtime:
                 if question["step_id"] is not None:
                     confirm_step_resolution(user_answer, arguments.get("resolution"))
                     payload["resolution"] = arguments["resolution"]
-            if "scope" in arguments:
+                if question.get("requested_operation") == "file.create":
+                    payload["scope"] = [await asyncio.to_thread(replacement_file_scope, user_answer)]
+            if "scope" in arguments and "scope" not in payload:
                 payload["scope"] = await asyncio.to_thread(
                     confirmed_scope, arguments["scope"], user_text, resolve_application,
                 )
