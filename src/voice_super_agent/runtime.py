@@ -1118,10 +1118,15 @@ class Runtime:
         tasks = self._require_tasks()
         self._update({"exit_error": ""})
         waiting_visible = False
+        requested = False
         try:
             while True:
                 async with self._task_exit_lock:
-                    progress = await tasks.request_shutdown()
+                    if requested:
+                        progress = await tasks.shutdown_progress()
+                    else:
+                        progress = await tasks.request_shutdown()
+                        requested = True
                     waiting = []
                     for entry in progress["waiting"]:
                         detail = await tasks.get_task(entry["task_id"])

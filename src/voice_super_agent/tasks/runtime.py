@@ -556,7 +556,8 @@ class TaskRuntime:
             try:
                 for detail in await self._store.load_unfinished():
                     task = detail["task"]
-                    if task["id"] in self._faults or task["stop_intent"] or task["state"] in {"waiting_user", "paused", "storage_error"}:
+                    if (task["id"] in self._faults or task["stop_intent"] or task["stop_reason"] == "shutdown"
+                            or task["state"] in {"waiting_user", "paused", "storage_error"}):
                         continue
                     task["stop_reason"] = "shutdown"
                     if task["id"] in self._running:
@@ -574,6 +575,10 @@ class TaskRuntime:
         if not execution.stop_requested and (step is None or step["status"] != "started" or step["request"]["cancellable"]):
             execution.stop_requested = True
             execution.task.cancel()
+
+    async def shutdown_progress(self):
+        async with self._lock:
+            return self._shutdown_progress()
 
     def _shutdown_progress(self):
         return {"requested": self._shutdown, "ready": self._shutdown and not self._running and not self._faults and not self._shutdown_error,
@@ -602,7 +607,7 @@ class TaskRuntime:
         await self.request_shutdown()
         while self._running:
             await asyncio.gather(*(execution.task for execution in list(self._running.values())), return_exceptions=False)
-        if not self._shutdown_progress()["ready"]:
+        if not (await self.shutdown_progress())["ready"]:
             raise RuntimeError("任务事实尚未保存，请解决保存错误后重试退出。")
         if self._dispatcher is not None:
             self._dispatcher.cancel()

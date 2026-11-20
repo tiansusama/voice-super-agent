@@ -417,6 +417,10 @@ async def test_shutdown_withdraw_keeps_uncancellable_action_and_user_pause(owner
         await asyncio.wait_for(entered.wait(), 2)
         progress = await runtime.request_shutdown()
         assert not progress["ready"] and progress["waiting"][0]["task_id"] == active
+        assert await runtime.shutdown_progress() == progress
+        assert await runtime.request_shutdown() == progress
+        changes = await runtime.list_changes()
+        assert [change["task_id"] for change in changes if change["text"] == "正在准备退出"] == [active]
         await runtime.withdraw_shutdown()
         release.set()
         await state(runtime, active, "completed")
