@@ -55,6 +55,18 @@ class DesktopApi:
     def read_history(self, message_id: str, offset: int = 0):
         return self._runtime.read_history(message_id, offset)
 
+    def list_tasks(self, cursor: int | None = None):
+        return self._runtime.list_tasks(cursor)
+
+    def get_task(self, task_id: str):
+        return self._runtime.get_task(task_id)
+
+    def task_command(self, task_id: str, action: str, payload: dict | None = None):
+        return self._runtime.task_command(task_id, action, payload)
+
+    def save_task_concurrency(self, limit: int):
+        return self._runtime.save_task_concurrency(limit)
+
     def floating_layout(self, card_height: float, controls_visible: bool, hint_visible: bool) -> None:
         self._runtime.update_windows(floating_card_height=ceil(card_height),
                                      floating_controls_visible=controls_visible, floating_hint_visible=hint_visible)

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 import logging
@@ -14,6 +15,9 @@ from websockets.exceptions import WebSocketException
 
 from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
+from voice_super_agent.tasks.interface import (
+    TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage, TaskService, TaskSummary,
+)
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.wake import KeywordDetector
@@ -28,7 +32,8 @@ class Runtime:
     """后台独占应用状态，通过队列向桌面提交状态和窗口命令。"""
 
     def __init__(self, desktop_check: bool = False, database_path: str | Path = ":memory:",
-                 wake_model_dir: Path | None = None):
+                 wake_model_dir: Path | None = None,
+                 task_factory: Callable[[ConversationStore, TaskChangeHandler], TaskService] | None = None):
         self._loop = asyncio.new_event_loop()
         self._thread = Thread(target=self._loop.run_forever, name="agent-runtime")
         self.events: Queue[dict[str, Any] | None] = Queue()
@@ -58,6 +63,8 @@ class Runtime:
         self._model_records: list[dict] = []
         self._window = {"display_start_position": 0, "model_start_position": 0}
         self._store = ConversationStore(database_path)
+        self._task_factory = task_factory
+        self._tasks: TaskService | None = None
         self._storage_ready = False
         self._revision = 0
         self._saved_revision = 0
@@ -110,6 +117,8 @@ class Runtime:
             "history_error": "",
             "restarting": False,
             "exit_error": "",
+            "task_revision": 0,
+            "task_concurrency": None,
         }
 
     def start(self) -> None:
@@ -155,6 +164,10 @@ class Runtime:
             message["status"] = "unfinished"
         if unfinished:
             self._request_save(immediate=True)
+        if self._task_factory is not None:
+            self._tasks = self._task_factory(self._store, self._task_changed)
+            await self._tasks.start()
+            self._update({"task_concurrency": await self._tasks.get_concurrency()})
         logger.info("已恢复 %s 条展示消息、%s 条原生模型消息", len(self._messages), len(self._model_records))
         self._idle_task = asyncio.create_task(self._watch_idle(), name="voice-idle")
         if self._wake_model_dir is not None:
@@ -199,6 +212,36 @@ class Runtime:
     def _snapshot(self) -> dict[str, Any]:
         return {"sequence": self._sequence, "state": dict(self._state),
                 "messages": [dict(message) for message in self._messages.values()][self._window["display_start_position"]:]}
+
+    async def _task_changed(self, change: TaskChange) -> None:
+        self._update({"task_revision": self._state["task_revision"] + 1})
+
+    def _require_tasks(self) -> TaskService:
+        if self._tasks is None:
+            raise ValueError("任务运行时尚未就绪。")
+        return self._tasks
+
+    def list_tasks(self, cursor: int | None = None) -> TaskPage:
+        return asyncio.run_coroutine_threadsafe(self._require_tasks().list_tasks(cursor, 20), self._loop).result()
+
+    def get_task(self, task_id: str) -> TaskDetail:
+        return asyncio.run_coroutine_threadsafe(self._require_tasks().get_task(task_id), self._loop).result()
+
+    def task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None = None) -> TaskSummary:
+        return asyncio.run_coroutine_threadsafe(self._task_command(task_id, action, payload), self._loop).result()
+
+    async def _task_command(self, task_id: str, action: TaskAction, payload: TaskCommandPayload | None) -> TaskSummary:
+        result = await self._require_tasks().task_command(task_id, action, payload)
+        self._update({"task_revision": self._state["task_revision"] + 1})
+        return result
+
+    def save_task_concurrency(self, limit: int) -> int:
+        return asyncio.run_coroutine_threadsafe(self._save_task_concurrency(limit), self._loop).result()
+
+    async def _save_task_concurrency(self, limit: int) -> int:
+        saved = await self._require_tasks().apply_concurrency(limit)
+        self._update({"task_concurrency": saved})
+        return saved
 
     def save_setting(self, name: str, value: Any) -> dict:
         return asyncio.run_coroutine_threadsafe(self._save_setting(name, value), self._loop).result()
@@ -987,6 +1030,8 @@ class Runtime:
             if not await self._prepare_exit():
                 raise RuntimeError(self._state["storage_error"])
         finally:
+            if self._tasks is not None:
+                await self._tasks.close()
             await self._store.close()
             self._views.clear()
             await self._loop.shutdown_asyncgens()
