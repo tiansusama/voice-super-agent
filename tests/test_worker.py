@@ -488,3 +488,26 @@ async def test_existing_application_window_is_insufficient_recovery_evidence():
     result = await ActionReconciler(inspect)(None, {"request": {
         "operation": "application.open", "target": "existing-minimized-app", "expected": {"application": "existing-minimized-app"}}})
     assert result["status"] == "uncertain" and result["result"]["current_observation"]["window"] == 123
+
+
+@pytest.mark.asyncio
+async def test_empty_model_response_is_persisted_as_retryable_failure(owner):
+    responses = iter([{"role": "assistant"}, {"role": "assistant", "content": "重试完成"}])
+
+    async def model(params):
+        return next(responses)
+
+    runtime = runtime_with(owner, model)
+    await runtime.start()
+    try:
+        batch = await runtime.dispatch(SOURCE, [plan("空回复", [("window.show", "main")])])
+        task_id = batch["tasks"][0]["id"]
+        failed = await state(runtime, task_id, "failed")
+        assert "有效回复" in failed["task"]["error"]
+        assert "retry" in (await runtime.get_task(task_id))["task"]["actions"]
+        await runtime.task_command(task_id, "retry")
+        completed = await state(runtime, task_id, "completed")
+        assert completed["task"]["result"] == "重试完成"
+        assert len(completed["executions"]) == 2
+    finally:
+        await runtime.close()

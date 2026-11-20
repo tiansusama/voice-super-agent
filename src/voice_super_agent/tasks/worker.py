@@ -120,8 +120,11 @@ class TaskWorker:
                         if not calls:
                             if changed:
                                 continue
+                            content = response.get("content")
+                            if not isinstance(content, str) or not content.strip():
+                                raise ValueError("Worker 模型未返回有效回复或工具调用。")
                             execution.model_call_id = "assistant-result"
-                            if await execution.complete(response["content"]):
+                            if await execution.complete(content):
                                 return
                             continue
                         call = calls[0]
