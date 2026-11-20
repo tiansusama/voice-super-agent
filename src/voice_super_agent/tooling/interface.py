@@ -74,7 +74,10 @@ class BuiltinTools:
             return {"window": "main", "visible": await self._get_window_visibility()}
         if self._applications is None:
             raise RuntimeError("Windows 应用当前不可查询。")
-        application = Application(target, "exe" if Path(target).is_absolute() else "apps", target)
+        if Path(target).is_absolute():
+            application = Application(target, "exe", target)
+        else:
+            application = await asyncio.to_thread(ApplicationTools({target}, self._applications).resolve, target)
         window = await asyncio.to_thread(self._applications.find_window, application)
         return {"target": target, "window": window}
 
@@ -83,7 +86,7 @@ class BuiltinTools:
         operation = request["operation"]
         try:
             evidence = await self.inspect_action(request)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return ActionResult(status="uncertain", result={}, artifacts=[], error=f"核对实际状态失败：{exc}")
 
         error = ""
