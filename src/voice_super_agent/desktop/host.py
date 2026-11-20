@@ -1,3 +1,4 @@
+import asyncio
 from collections import deque
 import ctypes
 from ctypes import wintypes
@@ -235,9 +236,37 @@ class Desktop:
 
         self.main.native.BeginInvoke(Action(action))
 
-    def _handle_command(self, command: str) -> bool:
+    async def get_main_visibility(self) -> bool:
+        return await asyncio.to_thread(self._run_main_on_gui, self._main_is_visible)
+
+    async def set_main_visibility(self, visible: bool) -> bool:
+        return await asyncio.to_thread(self._run_main_on_gui, lambda: self._set_main_visibility(visible))
+
+    def _run_main_on_gui(self, operation) -> bool:
+        from System import Boolean, Func
+
+        return bool(self.main.native.Invoke(Func[Boolean](operation)))
+
+    def _main_is_visible(self) -> bool:
         from System.Windows.Forms import FormWindowState
 
+        form = self.main.native
+        return form.Visible and form.WindowState != FormWindowState.Minimized
+
+    def _set_main_visibility(self, visible: bool) -> bool:
+        from System.Windows.Forms import FormWindowState
+
+        form = self.main.native
+        if visible:
+            form.Show()
+            form.WindowState = FormWindowState.Normal
+            form.Activate()
+            logger.info("显示已有主窗口")
+        else:
+            form.Hide()
+        return self._main_is_visible()
+
+    def _handle_command(self, command: str) -> bool:
         if command == "quit":
             if not self.runtime.prepare_exit():
                 self.activate()
@@ -248,14 +277,9 @@ class Desktop:
             self._gui(self._close_windows)
             return False
         if command == "show_main":
-            def show():
-                self.main.native.Show()
-                self.main.native.WindowState = FormWindowState.Normal
-                self.main.native.Activate()
-                logger.info("显示已有主窗口")
-            self._gui(show)
+            self._gui(lambda: self._set_main_visibility(True))
         elif command == "hide_main":
-            self._gui(self.main.native.Hide)
+            self._gui(lambda: self._set_main_visibility(False))
         elif command == "preview_floating":
             self._gui(self._show_preview)
         return True

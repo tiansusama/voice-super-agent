@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("mcp")
 from mcp import McpError, types
 from mcp.shared.memory import create_connected_server_and_client_session
 

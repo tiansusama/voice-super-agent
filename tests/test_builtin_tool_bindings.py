@@ -2,9 +2,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("mcp")
-from mcp.shared.memory import create_connected_server_and_client_session
-
+from voice_super_agent.tasks.mcp_client import MCPExecutionClient
 from voice_super_agent.tooling.interface import BuiltinTools
 
 
@@ -31,17 +29,17 @@ async def test_tool_server_uses_only_this_execution_scope(tmp_path):
     read_server = tools.create_server(access, [{"operation": "directory.list", "target": str(tmp_path)}])
     write_server = tools.create_server(access, [{"operation": "file.create", "target": str(path)}])
     async with (
-        create_connected_server_and_client_session(read_server) as reader,
-        create_connected_server_and_client_session(write_server) as writer,
+        MCPExecutionClient(read_server) as reader,
+        MCPExecutionClient(write_server) as writer,
     ):
-        rejected = await reader.call_tool("create_text_file", {"path": str(path), "content": "越界"})
-        assert rejected.isError
+        with pytest.raises(RuntimeError, match="未授权"):
+            await reader.call_tool("create_text_file", {"path": str(path), "content": "越界"})
         assert not path.exists()
         result = await writer.call_tool("create_text_file", {"path": str(path), "content": "报表"})
-        assert not result.isError
+        assert result["structuredContent"]["path"] == str(path)
         assert path.read_text(encoding="utf-8") == "报表"
         listing = await reader.call_tool("list_directory", {"path": str(tmp_path)})
-        assert listing.structuredContent["entries"] == [{"name": "新建.txt", "is_directory": False}]
+        assert listing["structuredContent"]["entries"] == [{"name": "新建.txt", "is_directory": False}]
     assert [request["operation"] for request in access.actions] == ["file.create", "directory.list"]
 
 
