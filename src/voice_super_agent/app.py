@@ -11,7 +11,7 @@ import webview
 from voice_super_agent.runtime import Runtime
 from voice_super_agent.desktop.host import Desktop
 from voice_super_agent.desktop.instance import SingleInstance
-from voice_super_agent.tasks import TaskRuntime, TaskWorker
+from voice_super_agent.tasks import create_task_runtime
 from voice_super_agent.tooling.apps import WindowsApps
 from voice_super_agent.tooling.interface import BuiltinTools
 from voice_super_agent.voice.wake import MODEL_NAME
@@ -65,10 +65,10 @@ def main() -> None:
         def task_factory(store, on_change):
             tools = BuiltinTools(WindowsApps(), set_window_visibility=desktop.set_main_visibility,
                                  get_window_visibility=desktop.get_main_visibility)
-            worker = TaskWorker(tools.create_server, api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
-                                model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
-                                base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"))
-            return TaskRuntime(store, worker, tools.reconcile_action, on_change=on_change)
+            return create_task_runtime(store, tools, api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
+                                       model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
+                                       base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+                                       on_change=on_change)
 
         runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3",
                           wake_model_dir=PROJECT_ROOT / "resources" / "models" / MODEL_NAME,
