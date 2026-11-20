@@ -164,7 +164,13 @@ class TaskRuntimeFault(TypedDict):
     known_result: ActionResult | None
 
 
-TaskChangeHandler = Callable[[TaskChange | TaskRuntimeFault], Awaitable[None]]
+class TaskSchedulerFault(TypedDict):
+    kind: Literal["scheduler_error"]
+    error: str
+
+
+TaskEvent = TaskChange | TaskRuntimeFault | TaskSchedulerFault
+TaskChangeHandler = Callable[[TaskEvent], Awaitable[None]]
 
 
 class TaskService(Protocol):
@@ -193,7 +199,7 @@ class TaskService(Protocol):
 
     async def mark_read(self, notification_id: str) -> None: ...
 
-    async def next_change(self) -> TaskChange | TaskRuntimeFault: ...
+    async def next_change(self) -> TaskEvent: ...
 
     async def request_shutdown(self) -> ShutdownProgress: ...
 

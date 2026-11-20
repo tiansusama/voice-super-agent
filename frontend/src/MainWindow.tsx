@@ -166,6 +166,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
           {state.model_error && <div className="notice warning" role="alert"><p>{state.model_error}</p></div>}
           {state.storage_error && <div className="notice warning" role="alert"><p>{state.storage_error}</p></div>}
           {state.task_error && <div className="notice warning" role="alert"><p>{state.task_error}</p></div>}
+          {state.task_scheduler_error && <div className="notice warning" role="alert"><p>{state.task_scheduler_error}</p></div>}
           {state.exit_error && <div className="notice warning" role="alert"><p>{state.exit_error}</p>
             <button className="notice-action" onClick={() => void command('quit')} disabled={state.exiting}>再次退出</button></div>}
           {waitingForExit && <div className="notice" role="status">

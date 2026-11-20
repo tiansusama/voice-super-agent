@@ -20,7 +20,7 @@ from voice_super_agent.task_tools import (
 )
 from voice_super_agent.tasks.interface import (
     ShutdownProgress, TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail,
-    TaskPage, TaskRuntimeFault, TaskService, TaskSource, TaskSummary,
+    TaskEvent, TaskPage, TaskService, TaskSource, TaskSummary,
 )
 from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
@@ -72,7 +72,7 @@ class Runtime:
         self._tasks: TaskService | None = None
         self._task_reply_id: str | None = None
         self._task_projection: asyncio.Task | None = None
-        self._task_updates: asyncio.Queue[tuple[TaskChange | TaskRuntimeFault, int | None]] = asyncio.Queue()
+        self._task_updates: asyncio.Queue[tuple[TaskEvent, int | None]] = asyncio.Queue()
         self._task_exit: asyncio.Task | None = None
         self._task_exit_lock = asyncio.Lock()
         self._task_position = 0
@@ -138,6 +138,7 @@ class Runtime:
             "task_concurrency": None,
             "task_shutdown": None,
             "task_error": "",
+            "task_scheduler_error": "",
         }
 
     def start(self) -> None:
@@ -257,7 +258,7 @@ class Runtime:
                 "messages": messages, "task_cards": [dict(task) for task in self._task_cards.values()
                                                       if task["source"]["message_id"] in visible]}
 
-    async def _on_task_change(self, change: TaskChange | TaskRuntimeFault) -> None:
+    async def _on_task_change(self, change: TaskEvent) -> None:
         activation = self._voice_activation if self._state["voice_status"] == "active" else None
         self._task_updates.put_nowait((change, activation))
 
@@ -265,6 +266,9 @@ class Runtime:
         tasks = self._require_tasks()
         while True:
             change, activation = await self._task_updates.get()
+            if change["kind"] == "scheduler_error":
+                self._update({"task_scheduler_error": change["error"]})
+                continue
             fault = change["kind"] == "storage_error"
             if not fault and change["position"] <= self._task_position:
                 continue

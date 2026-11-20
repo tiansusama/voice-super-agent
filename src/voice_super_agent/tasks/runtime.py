@@ -280,40 +280,57 @@ class TaskRuntime:
             raise ValueError("任务输入必须关联已保存的正式用户消息。")
 
     async def _schedule(self):
+        error = ""
         while True:
             await self._wake.wait()
             self._wake.clear()
-            async with self._lock:
-                if self._shutdown:
+            try:
+                async with self._lock:
+                    if self._shutdown:
+                        continue
+                    await self._schedule_ready()
+            except (sqlite3.Error, OSError) as exc:
+                message = f"读取任务队列失败：{exc}"
+                if message != error:
+                    logger.exception("读取任务队列失败")
+                    error = message
+                    await self._publish({"kind": "scheduler_error", "error": error})
+                await asyncio.sleep(0.25)
+                self._wake.set()
+            else:
+                if error:
+                    error = ""
+                    await self._publish({"kind": "scheduler_error", "error": error})
+
+    async def _schedule_ready(self):
+        limit = await self._store.get_concurrency()
+        unfinished = await self._store.load_unfinished()
+        unfinished.sort(key=lambda detail: detail["task"]["state"] != "recovering")
+        for detail in unfinished:
+            task = detail["task"]
+            if task["id"] in self._running or task["id"] in self._faults or task["state"] not in {"queued", "recovering"}:
+                continue
+            # 核对可以先释放旧资源，再按并发上限安排后续执行。
+            if self._active_count() >= limit:
+                needs_inspection = task["state"] == "recovering" and any(
+                    step["status"] in {"started", "uncertain"} for step in detail["steps"])
+                if not needs_inspection:
                     continue
-                limit = await self._store.get_concurrency()
-                unfinished = await self._store.load_unfinished()
-                unfinished.sort(key=lambda detail: detail["task"]["state"] != "recovering")
-                for detail in unfinished:
-                    task = detail["task"]
-                    if task["id"] in self._running or task["id"] in self._faults or task["state"] not in {"queued", "recovering"}:
-                        continue
-                    # 核对可以先释放旧资源，再按并发上限安排后续执行。
-                    if self._active_count() >= limit:
-                        needs_inspection = task["state"] == "recovering" and any(
-                            step["status"] in {"started", "uncertain"} for step in detail["steps"])
-                        if not needs_inspection:
-                            continue
-                    dependencies = [await self._store.get_task(dependency) for dependency in detail["depends_on"]]
-                    if any(dependency["task"]["state"] != "completed" for dependency in dependencies):
-                        continue
-                    execution_id = uuid4().hex
-                    reason = task.pop("next_reason", "recovery" if task["state"] == "recovering" else "dispatch")
-                    detail["executions"].append({"id": execution_id, "reason": reason, "state": "running",
-                                                 "started_at": datetime.now(timezone.utc).isoformat(), "ended_at": None, "error": ""})
-                    task.update(state="running", execution_id=execution_id, progress="开始执行")
-                    try:
-                        await self._commit(detail, [{"kind": "state", "text": task["progress"]}])
-                    except (sqlite3.Error, OSError):
-                        continue
-                    execution = _Execution(self, task["id"], execution_id)
-                    self._running[task["id"]] = execution
-                    execution.task = asyncio.create_task(self._execute(execution, reason), name=f"task-{task['id']}")
+            dependencies = [await self._store.get_task(dependency) for dependency in detail["depends_on"]]
+            if any(dependency["task"]["state"] != "completed" for dependency in dependencies):
+                continue
+            execution_id = uuid4().hex
+            reason = task.pop("next_reason", "recovery" if task["state"] == "recovering" else "dispatch")
+            detail["executions"].append({"id": execution_id, "reason": reason, "state": "running",
+                                         "started_at": datetime.now(timezone.utc).isoformat(), "ended_at": None, "error": ""})
+            task.update(state="running", execution_id=execution_id, progress="开始执行")
+            try:
+                await self._commit(detail, [{"kind": "state", "text": task["progress"]}])
+            except (sqlite3.Error, OSError):
+                continue
+            execution = _Execution(self, task["id"], execution_id)
+            self._running[task["id"]] = execution
+            execution.task = asyncio.create_task(self._execute(execution, reason), name=f"task-{task['id']}")
 
     async def _execute(self, execution, reason):
         try:

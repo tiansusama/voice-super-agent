@@ -319,6 +319,39 @@ async def test_resource_waiters_release_capacity_and_obey_limit_when_ready(owner
 
 
 @pytest.mark.asyncio
+async def test_scheduler_reports_read_error_and_continues_after_storage_recovers(owner, monkeypatch):
+    store = TaskStore(owner)
+    task_id = (await store.dispatch(SOURCE, [plan("pending")]))["tasks"][0]["id"]
+    load = TaskStore.load_unfinished
+    reads = 0
+
+    async def fail_first_scheduler_read(self):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise sqlite3.OperationalError("测试调度读取失败")
+        return await load(self)
+
+    async def worker(execution):
+        await execution.complete("任务已完成")
+
+    monkeypatch.setattr(TaskStore, "load_unfinished", fail_first_scheduler_read)
+    runtime = TaskRuntime(owner, worker, uncertain)
+    await runtime.start()
+    try:
+        error = await asyncio.wait_for(runtime.next_change(), 1)
+        assert error["kind"] == "scheduler_error"
+        assert "测试调度读取失败" in error["error"]
+        assert (await state(runtime, task_id, "completed"))["task"]["result"] == "任务已完成"
+        async with asyncio.timeout(2):
+            while (update := await runtime.next_change())["kind"] != "scheduler_error":
+                pass
+        assert update["error"] == ""
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_successful_action_write_failure_retains_fact_and_retry_does_not_repeat(owner, monkeypatch):
     executed = []
     original = TaskStore.save_task
