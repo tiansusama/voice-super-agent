@@ -102,7 +102,7 @@ interface Window {
       connect(): Promise<DesktopConnection>;
       command(name: string): Promise<void>;
       send_text(text: string): Promise<{ user_message_id: string; reply_id: string }>;
-      resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string }>;
+      resend_text(user_message_id: string): Promise<{ user_message_id: string; reply_id: string; existing_task_ids?: string[] }>;
       save_setting(name: SettingName, value: string | number): Promise<{ pending: boolean }>;
       list_history(before_position?: number): Promise<HistoryPage>;
       read_history(message_id: string, offset?: number): Promise<HistoryOriginal>;

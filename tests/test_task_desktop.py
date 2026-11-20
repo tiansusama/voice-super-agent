@@ -167,7 +167,10 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
         body = await request.json()
         message = body["messages"][-1]
         if message["role"] == "tool":
-            tool_results.put_nowait(json.loads(message["content"]))
+            result = json.loads(message["content"])
+            tool_results.put_nowait(result)
+            if "tasks" in result:
+                return web.json_response({"error": {"message": "任务已保存，但聊天回复失败"}}, status=503)
             delta, finish = {"content": "已收到。"}, "stop"
         else:
             assert any(tool["function"]["name"] == "dispatch_tasks" for tool in body["tools"])
@@ -203,6 +206,11 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
             while not runtime.connect("main")["task_cards"]:
                 await asyncio.sleep(.01)
         assert runtime.connect("main")["task_cards"][0]["id"] == task["id"]
+        async with asyncio.timeout(5):
+            while runtime.connect("main")["messages"][-1]["status"] != "failed":
+                await asyncio.sleep(.01)
+        assert runtime.resend_text(accepted["user_message_id"])["existing_task_ids"] == [task["id"]]
+        assert len(runtime.connect("main")["messages"]) == 2
 
         runtime.send_text("请告诉我还有哪些任务？")
         denied = await asyncio.wait_for(tool_results.get(), 5)

@@ -486,14 +486,21 @@ class Runtime:
     def send_text(self, text: str) -> dict[str, str]:
         return asyncio.run_coroutine_threadsafe(self._send_text(text), self._loop).result()
 
-    def resend_text(self, user_message_id: str) -> dict[str, str]:
+    def resend_text(self, user_message_id: str) -> dict[str, Any]:
         return asyncio.run_coroutine_threadsafe(self._resend_text(user_message_id), self._loop).result()
 
-    async def _resend_text(self, user_message_id: str) -> dict[str, str]:
+    async def _resend_text(self, user_message_id: str) -> dict[str, Any]:
         message = self._messages[user_message_id]
         if (message["role"] != "user" or message["source"] != "text"
                 or self._messages[message["reply_id"]]["status"] != "failed"):
             raise ValueError("只能重新发送回答失败的文字消息。")
+        if self._tasks is not None:
+            batch = await self._tasks.find_batch(user_message_id)
+            if batch is not None:
+                self._task_cards.update((task["id"], task) for task in batch["tasks"])
+                self._update({"task_revision": self._state["task_revision"] + 1})
+                return {"user_message_id": user_message_id, "reply_id": message["reply_id"],
+                        "existing_task_ids": [task["id"] for task in batch["tasks"]]}
         # 从后台原消息读取正文，沿普通发送路径追加新输入并执行接管。
         return await self._send_text(message["text"])
 

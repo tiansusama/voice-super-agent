@@ -76,8 +76,15 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
     sendingRef.current = true;
     setSending(true);
     try {
-      if (originalMessageId) await window.pywebview!.api.resend_text(originalMessageId);
-      else {
+      if (originalMessageId) {
+        const sent = await window.pywebview!.api.resend_text(originalMessageId);
+        if (sent.existing_task_ids?.length) {
+          setSelectedTask(sent.existing_task_ids.length === 1 ? sent.existing_task_ids[0] : null);
+          setPage('tasks');
+          setError('');
+          return;
+        }
+      } else {
         await window.pywebview!.api.send_text(text);
         setDraft(current => current === draft ? '' : current);
       }
