@@ -88,6 +88,7 @@ class TaskCommandPayload(TypedDict, total=False):
 
 class TaskDetail(TypedDict):
     task: TaskSummary
+    priority: int
     scope: list[ScopeGrant]
     depends_on: list[str]
     related_task_id: str | None

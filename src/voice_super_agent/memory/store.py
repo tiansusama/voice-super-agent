@@ -31,6 +31,9 @@ class ConversationStore:
         if version < 3:
             script = Path(__file__).with_name("migrations") / "V1.0.0_003__interaction_settings.sql"
             self._connection.executescript(script.read_text(encoding="utf-8"))
+        if version < 4:
+            script = Path(__file__).with_name("migrations") / "V1.0.1_004__tasks.sql"
+            self._connection.executescript(script.read_text(encoding="utf-8"))
         messages = [dict(row) for row in self._connection.execute("SELECT * FROM display_messages ORDER BY position")]
         records = [
             {"display_message_id": row["display_message_id"], "message": json.loads(row["message_json"])}
@@ -41,6 +44,12 @@ class ConversationStore:
             del message["position"]
         del window["id"]
         return {"messages": messages, "model_records": records, "window": window}
+
+    async def task_io(self, operation, *arguments):
+        """任务事务复用同一个连接及 I/O 线程，连接始终在线程内使用。"""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor, operation, self._connection, *arguments,
+        )
 
     async def save(self, messages: list[dict], model_records: list[dict], window: dict) -> None:
         await asyncio.get_running_loop().run_in_executor(self._executor, self._save, messages, model_records, window)

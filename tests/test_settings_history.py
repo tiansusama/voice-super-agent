@@ -45,7 +45,7 @@ def test_saved_hotkey_and_timeout_override_environment_after_restart(tmp_path, m
         state = runtime.connect("main")["state"]
         assert (state["wake_hotkey"], state["voice_idle_seconds"]) == ("Ctrl+Alt+K", 42)
         with sqlite3.connect(path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         runtime.stop()
 
