@@ -264,6 +264,16 @@ async def voice(tmp_path, monkeypatch, request):
                 for change in await self.save_task(detail, [{"kind": "result", "text": result}]):
                     await self.notify(change)
 
+            async def save_question(self, task_id, text):
+                detail = await self.get_task(task_id)
+                question = {"id": "output-question", "task_id": task_id, "execution_id": None, "step_id": None,
+                            "status": "open", "answer": None, "text": text, "created_at": detail["task"]["created_at"]}
+                detail["questions"].append(question)
+                detail["task"].update(state="waiting_user", actions=["answer"])
+                for change in await self.save_task(detail, [{"kind": "question", "text": text,
+                                                           "question_id": question["id"]}]):
+                    await self.notify(change)
+
         def task_factory(store, notify):
             tasks = TestTasks(store)
             tasks.notify = notify
@@ -330,6 +340,30 @@ async def test_saved_voice_task_results_play_when_idle_and_stay_unread_in_standb
                                                 for message in s["messages"]))
     assert not next(message["task_notice"]["read"] for message in interrupted["messages"]
                     if "播报中途接管" in message["text"])
+
+
+@pytest.mark.parametrize("voice", ["tasks"], indirect=True)
+@pytest.mark.asyncio
+async def test_queued_task_question_plays_before_a_waiting_result(voice):
+    voice.tools["显示小博主窗口。"] = ("dispatch_tasks", {"plans": [
+        {"key": key, "title": title, "goal": "显示小博",
+         "scope": [{"operation": "window.show", "target": "小博主窗口"}]}
+        for key, title in (("a", "任务甲"), ("b", "任务乙"))
+    ]})
+    await voice.wake()
+    await voice.transcript("显示小博主窗口。")
+    snapshot = await voice.wait(lambda s: len(s["task_cards"]) == 2 and s["state"]["voice_playing"])
+    tasks = {task["title"]: task["id"] for task in snapshot["task_cards"]}
+    await voice.backend(voice.tasks.save_result(tasks["任务甲"], "第一个任务已有结果"))
+    await voice.backend(voice.tasks.save_question(tasks["任务乙"], "请回答第二个任务的问题"))
+    await voice.wait(lambda s: sum(bool(message.get("task_notice")) for message in s["messages"]) == 2)
+    voice.release_audio()
+    await voice.wait(lambda s: sum(bool(message.get("task_notice", {}).get("read")) for message in s["messages"]) == 2)
+
+    spoken = [request["req_params"]["text"] for request in voice.tts_requests]
+    question = next(index for index, text in enumerate(spoken) if "请回答第二个任务的问题" in text)
+    result = next(index for index, text in enumerate(spoken) if "第一个任务已有结果" in text)
+    assert question < result
 
 
 @pytest.mark.asyncio
