@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, AudioLines, Check, CircleStop, Clock3, CornerDownLeft,
+import { ArrowDown, AudioLines, Check, CircleStop, Clock3, CornerDownLeft, ListTodo,
   MessageCircle, RotateCcw, SendHorizontal, Settings2, UserRound } from 'lucide-react';
 import { SettingsPanel } from './SettingsPanel';
 import { HistoryPanel } from './HistoryPanel';
+import { TaskConcurrencySetting, TaskPanel, type RunTaskAction } from './TaskPanel';
 import './settings-history.css';
 
 export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSnapshot; connectionError: string }) {
-  const [page, setPage] = useState<'chat' | 'history' | 'settings'>('chat');
+  const [page, setPage] = useState<'chat' | 'history' | 'settings' | 'tasks'>('chat');
+  const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
@@ -17,6 +19,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
   const followLatest = useRef(true);
   const state = snapshot.state;
   const voiceBusy = ['starting', 'active', 'stopping'].includes(state.voice_status);
+  const tasksAvailable = state.task_concurrency != null;
   const voiceSwitching = ['starting', 'stopping'].includes(state.voice_status);
   const canOperate = !state.exiting && !state.restarting && !state.storage_error && !state.exit_error;
   const canSend = state.model_available && canOperate && !voiceSwitching;
@@ -89,6 +92,14 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
     }
   }
 
+  function openTask(id: string) {
+    setSelectedTask(id);
+    setPage('tasks');
+  }
+
+  const taskCommand: RunTaskAction = (taskId, action, payload) =>
+    window.pywebview!.api.task_command!(taskId, action, payload);
+
   return (
     <div className="desktop-shell">
       <aside className="sidebar" aria-label="主导航">
@@ -97,6 +108,8 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
             onClick={() => setPage('chat')}><MessageCircle size={25} strokeWidth={1.6} /><span>对话</span></button>
           <button className={`nav-item ${page === 'history' ? 'selected' : ''}`} aria-current={page === 'history' ? 'page' : undefined}
             onClick={() => setPage('history')}><Clock3 size={25} strokeWidth={1.6} /><span>历史记录</span></button>
+          {tasksAvailable && <button className={`nav-item ${page === 'tasks' ? 'selected' : ''}`} aria-current={page === 'tasks' ? 'page' : undefined}
+            onClick={() => { setSelectedTask(null); setPage('tasks'); }}><ListTodo size={25} strokeWidth={1.6} /><span>任务</span></button>}
         </nav>
         <button className={`nav-item settings-nav ${page === 'settings' ? 'selected' : ''}`} aria-current={page === 'settings' ? 'page' : undefined}
           onClick={() => setPage('settings')}><Settings2 size={25} strokeWidth={1.6} /><span>设置</span></button>
@@ -105,7 +118,7 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
       <main className="workspace">
         <header className="workspace-header">
           <div className="agent-heading">
-            <h1>{page === 'chat' ? '小博' : page === 'history' ? '历史记录' : '设置'}</h1>
+            <h1>{{ chat: '小博', history: '历史记录', settings: '设置', tasks: '任务' }[page]}</h1>
             <div className="agent-status" role="status" aria-live="polite">
               <span className={`voice-status ${state.voice_status}`}><span className="status-dot" />{voiceLabel}</span>
               {processingLabel && <span className="processing-status">{processingLabel}</span>}
@@ -205,7 +218,12 @@ export function MainWindow({ snapshot, connectionError }: { snapshot: DesktopSna
         </div>
 
         {page === 'history' && <HistoryPanel />}
-        {page === 'settings' && <SettingsPanel state={state} command={command} />}
+        {page === 'tasks' && tasksAvailable && <TaskPanel selected={selectedTask} revision={state.task_revision ?? 0}
+          open={openTask} close={() => setSelectedTask(null)} command={taskCommand} />}
+        {page === 'settings' && <SettingsPanel state={state} command={command}>
+          {state.task_concurrency != null && <TaskConcurrencySetting limit={state.task_concurrency}
+            save={limit => window.pywebview!.api.save_task_concurrency!(limit)} disabled={!canOperate} />}
+        </SettingsPanel>}
 
         {state.desktop_check && <section className="desktop-check"><details><summary>桌面联调 · 后台计数 {state.activity_tick} · 状态序号 {snapshot.sequence}</summary>
           <div className="actions"><button onClick={() => void command(state.activity_running ? 'stop_activity' : 'start_activity')}>

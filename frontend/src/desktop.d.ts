@@ -52,6 +52,8 @@ interface DesktopSnapshot {
     history_error: string;
     restarting: boolean;
     exit_error: string;
+    task_revision?: number;
+    task_concurrency?: number | null;
   };
 }
 
@@ -102,6 +104,10 @@ interface Window {
       list_history(before_position?: number): Promise<HistoryPage>;
       read_history(message_id: string, offset?: number): Promise<HistoryOriginal>;
       floating_layout(card_height: number, controls_visible: boolean, hint_visible: boolean): Promise<void>;
+      list_tasks?(cursor?: number): Promise<{ tasks: import('./TaskPanel').TaskSummary[]; next_cursor: number | null }>;
+      get_task?(task_id: string): Promise<import('./TaskPanel').TaskDetail>;
+      task_command?: import('./TaskPanel').RunTaskAction;
+      save_task_concurrency?(limit: number): Promise<number>;
     };
   };
 }

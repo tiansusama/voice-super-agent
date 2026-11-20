@@ -1,0 +1,14 @@
+.task-panel { flex: 1; min-height: 0; overflow: auto; padding: 18px 0; }
+.task-card, .task-answer, .task-question { padding: 14px 16px; margin: 0 0 10px; border: 1px solid var(--line); border-radius: 12px; background: #fffdfb; }
+.task-card header, .task-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.desktop-shell .task-title { margin-right: auto; border: 0; background: transparent; color: var(--ink); font-weight: 600; text-align: left; padding: 2px 0; }
+.desktop-shell .task-title:hover { text-decoration: underline; background: transparent; }
+.task-card p, .task-question p { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-state, .task-unread, .task-detail small { color: var(--muted); font-size: 12px; }
+.task-unread { color: #925d32; }
+.task-actions { margin-top: 10px; }
+.task-detail { margin-top: 12px; }
+.task-detail small { display: block; margin-bottom: 14px; }
+.task-detail li { overflow-wrap: anywhere; }
+.task-answer label, .task-answer textarea { display: block; margin-bottom: 8px; }
+.task-answer textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fffdfb; color: var(--ink); font: inherit; resize: vertical; }

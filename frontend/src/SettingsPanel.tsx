@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, Keyboard } from 'lucide-react';
 
-export function SettingsPanel({ state, command }: {
+export function SettingsPanel({ state, command, children }: {
   state: DesktopSnapshot['state']; command: (name: string) => Promise<void>;
+  children?: ReactNode;
 }) {
   const savedWord = state.pending_wake_word ?? state.wake_word;
   const [word, setWord] = useState(savedWord);
@@ -76,6 +77,7 @@ export function SettingsPanel({ state, command }: {
         {status('idle_seconds')}
       </form>
     </div>
+    {children}
     <div className="info-card service-settings"><h3>模型与语音服务</h3><p>模型凭据与服务参数通过本地 .env 配置，修改后重启生效。已保存的交互设置优先于 .env 中的对应项。</p>
       <dl><div><dt>对话模型</dt><dd>{state.model}</dd></div><div><dt>录音设备</dt><dd>{state.microphone_device || 'Windows 默认录音设备'}</dd></div>
         <div><dt>播放设备</dt><dd>{state.playback_device || 'Windows 默认播放设备'}</dd></div></dl>
