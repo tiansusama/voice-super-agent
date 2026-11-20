@@ -15,9 +15,11 @@ from websockets.exceptions import WebSocketException
 
 from voice_super_agent.conversation import Conversation
 from voice_super_agent.memory.store import ConversationStore
+from voice_super_agent.task_tools import confirmed_scope, validate_task_arguments
 from voice_super_agent.tasks.interface import (
-    TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage, TaskService, TaskSummary,
+    TaskAction, TaskChange, TaskChangeHandler, TaskCommandPayload, TaskDetail, TaskPage, TaskService, TaskSource, TaskSummary,
 )
+from voice_super_agent.tooling.apps import ApplicationTools, WindowsApps
 from voice_super_agent.voice.lifecycle import VoiceLifecycle, WakeSettings
 from voice_super_agent.desktop.hotkey import HoldHotkey
 from voice_super_agent.voice.wake import KeywordDetector
@@ -65,6 +67,7 @@ class Runtime:
         self._store = ConversationStore(database_path)
         self._task_factory = task_factory
         self._tasks: TaskService | None = None
+        self._task_reply_id: str | None = None
         self._storage_ready = False
         self._revision = 0
         self._saved_revision = 0
@@ -243,6 +246,52 @@ class Runtime:
         self._update({"task_concurrency": saved})
         return saved
 
+    def _task_source(self, reply_id: str) -> tuple[TaskSource, str]:
+        user_id = self._user_ids[reply_id]
+        message = self._messages[user_id]
+        state = self._state
+        if (reply_id != self._task_reply_id or reply_id != state["active_reply_id"]
+                or message["status"] != "completed" or state["exiting"] or state["restarting"]):
+            raise ValueError("只能为当前已提交的用户消息处理任务。")
+        return TaskSource(message_id=user_id, reply_id=reply_id, source=message["source"]), message["text"]
+
+    async def _model_task_command(self, name: str, arguments: dict, reply_id: str) -> dict:
+        tasks = self._require_tasks()
+        validate_task_arguments(name, arguments)
+        source, user_text = self._task_source(reply_id)
+        if name == "list_tasks":
+            return await tasks.list_tasks(arguments.get("cursor"))
+        if name == "get_task":
+            detail = await tasks.get_task(arguments["task_id"])
+            return {"task": detail["task"], "questions": detail["questions"], "artifacts": detail["artifacts"]}
+
+        def resolve_application(target: str) -> str:
+            return ApplicationTools({target}, WindowsApps()).resolve(target).target
+
+        if name == "dispatch_tasks":
+            plans = [{**plan, "scope": await asyncio.to_thread(
+                confirmed_scope, plan["scope"], user_text, resolve_application,
+            )} for plan in arguments["plans"]]
+        else:
+            payload = TaskCommandPayload(source=source)
+            for field in ("text", "question_id"):
+                if field in arguments:
+                    payload[field] = arguments[field]
+            if "scope" in arguments:
+                payload["scope"] = await asyncio.to_thread(
+                    confirmed_scope, arguments["scope"], user_text, resolve_application,
+                )
+        if not await asyncio.shield(self._flush()):
+            raise ValueError(self._state["storage_error"])
+        # 完成输入保存后再检查接管状态，已经提交的任务由任务运行时持续执行。
+        self._task_source(reply_id)
+        if name == "dispatch_tasks":
+            batch = await asyncio.shield(tasks.dispatch(source, plans))
+            self._update({"task_revision": self._state["task_revision"] + 1})
+            return batch
+        result = await asyncio.shield(self._task_command(arguments["task_id"], arguments["action"], payload))
+        return {"task": result}
+
     def save_setting(self, name: str, value: Any) -> dict:
         return asyncio.run_coroutine_threadsafe(self._save_setting(name, value), self._loop).result()
 
@@ -389,6 +438,7 @@ class Runtime:
             self._lifecycle.new_input()
             epoch = self._conversation.begin_text_takeover()
         user_id, reply_id = uuid4().hex, uuid4().hex
+        self._task_reply_id = reply_id
         timestamp = datetime.now(timezone.utc).isoformat()
         self._messages[user_id] = {
             "id": user_id, "role": "user", "source": "text", "reply_id": reply_id,
@@ -448,6 +498,7 @@ class Runtime:
             voice=voice,
             history=self._history_call,
             context_reference=self._context_reference,
+            task_command=self._model_task_command if self._tasks is not None else None,
         )
         return conversation
 
@@ -737,6 +788,7 @@ class Runtime:
                 if self._state["floating_reply_id"] != reply_id:
                     self._state.update(floating_reply_id=reply_id, preview_expanded=True)
                 if event["type"] == "voice_input":
+                    self._task_reply_id = None
                     self._lifecycle.new_input()
                     self._lifecycle.activity("input", True, self._loop.time())
                 self._user_ids[reply_id] = event["user_id"]
@@ -744,6 +796,7 @@ class Runtime:
                     self._messages[reply_id] = {"id": reply_id, "role": "assistant", "source": "voice", "reply_id": reply_id,
                                                 "text": "", "status": "queued", "created_at": event["created_at"], "error": ""}
                 if event["type"] in {"voice_committed", "voice_unfinished"}:
+                    self._task_reply_id = reply_id if event["type"] == "voice_committed" else None
                     self._lifecycle.activity("input", False, self._loop.time())
                     self._lifecycle.activity(f"reply:{reply_id}", True, self._loop.time())
                     self._messages[reply_id]["status"] = "thinking"
