@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { ArrowDown, ArrowLeft } from 'lucide-react';
 import './tasks.css';
 
@@ -107,6 +107,7 @@ export function TaskCard({ task, open, command }: {
 }
 
 export function QuestionReply({ question, command }: { question: TaskQuestion; command: RunTaskAction }) {
+  const fieldId = useId();
   const [text, setText] = useState('');
   const [resolution, setResolution] = useState<StepResolution | ''>('');
   const [pending, setPending] = useState(false);
@@ -129,12 +130,12 @@ export function QuestionReply({ question, command }: { question: TaskQuestion; c
   }
 
   return <form className="task-answer" onSubmit={event => { event.preventDefault(); void answer(); }}>
-    <label htmlFor={`question-${question.id}`}>{question.text}</label>
-    {question.step_id ? <select id={`question-${question.id}`} value={resolution}
+    <label htmlFor={fieldId}>{question.text}</label>
+    {question.step_id ? <select id={fieldId} value={resolution}
       onChange={event => setResolution(event.target.value as StepResolution | '')} disabled={pending} required>
       <option value="">选择实际结果</option>
       {Object.entries(stepResolutionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-    </select> : <textarea id={`question-${question.id}`} value={text} onChange={event => setText(event.target.value)}
+    </select> : <textarea id={fieldId} value={text} onChange={event => setText(event.target.value)}
       disabled={pending} rows={2} required />}
     <button type="submit" className="quiet-button" disabled={pending || !(question.step_id ? resolution : text.trim())}>
       {pending ? '正在提交…' : '提交答复'}
