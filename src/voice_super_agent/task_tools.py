@@ -112,7 +112,8 @@ def validate_task_arguments(name: str, arguments: dict) -> None:
 
 def task_command_intent(action: str, user_text: str, task: dict) -> tuple[bool, str]:
     """从用户原话提取已明确的任务目标和答复，模型参数仅负责定位候选。"""
-    instruction = user_text.strip().rstrip("。！!").strip()
+    instruction = user_text.strip()
+    bare_command = instruction.rstrip("。！!").rstrip()
     verb = "(?:" + "|".join(_TASK_VERBS[action]) + ")"
     prefix = r"(?:(?:请|麻烦|帮我|先|把|将)\s*)*"
     for is_id, name in ((True, task["id"]), (False, task["title"])):
@@ -123,7 +124,7 @@ def task_command_intent(action: str, user_text: str, task: dict) -> tuple[bool, 
             match = re.fullmatch(rf"{prefix}{action_target}\s*[:：]\s*(?P<text>\S[\s\S]*)", instruction, re.IGNORECASE)
             if match is not None:
                 return is_id, match["text"]
-        elif re.fullmatch(rf"{prefix}{action_target}", instruction, re.IGNORECASE):
+        elif re.fullmatch(rf"{prefix}{action_target}", bare_command, re.IGNORECASE):
             return is_id, ""
     raise ValueError("请明确说明要操作的任务名称及动作。答复可说「回答任务名称：答复内容」，也可在任务详情直接提交。")
 

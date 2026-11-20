@@ -415,7 +415,7 @@ class Runtime:
             if not by_id:
                 cursor = None
                 while True:
-                    page = await tasks.list_tasks(cursor, 100)
+                    page = await tasks.list_tasks(cursor)
                     if any(candidate["title"].casefold() == detail["task"]["title"].casefold()
                            and candidate["id"] != detail["task"]["id"] and action in candidate["actions"]
                            for candidate in page["tasks"]):

@@ -9,6 +9,7 @@ import pytest
 from voice_super_agent.desktop.host import DesktopApi
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.runtime import Runtime
+from voice_super_agent.task_tools import replacement_file_scope, task_command_intent
 from voice_super_agent.tasks.mcp_client import MCPExecutionClient
 from voice_super_agent.tasks.recovery import ActionReconciler
 from voice_super_agent.tasks.runtime import TaskRuntime
@@ -336,35 +337,26 @@ async def test_main_agent_dispatches_from_persisted_user_message(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_model_cannot_pause_a_task_without_the_users_explicit_target(monkeypatch):
-    commands = []
+async def test_model_cannot_pause_a_task_without_the_users_explicit_target(tmp_path, monkeypatch):
     results = asyncio.Queue()
-    task = {"id": "report", "title": "生成报告", "state": "running", "actions": ["pause"],
-            "source": {"message_id": "earlier"}}
+    path = tmp_path / "control.sqlite3"
+    store = ConversationStore(path)
+    await store.open()
+    try:
+        source = {"message_id": "request", "reply_id": "reply", "source": "text"}
+        await store.save([{"id": "request", "reply_id": "reply", "role": "user", "source": "text",
+                           "text": "生成报告", "status": "completed", "error": "", "created_at": "2026-11-20"}],
+                         [], {"display_start_position": 0, "model_start_position": 0})
+        batch = await TaskStore(store).dispatch(source, [{
+            "key": "report", "title": "生成报告", "goal": "生成报告",
+            "scope": [{"operation": "window.show", "target": "main"}],
+        }])
+        task_id = batch["tasks"][0]["id"]
+    finally:
+        await store.close()
 
-    class TaskService:
-        async def start(self):
-            pass
-
-        async def close(self):
-            pass
-
-        async def get_concurrency(self):
-            return 2
-
-        async def list_changes(self, after_position, limit):
-            return []
-
-        async def list_tasks(self, cursor=None, limit=20):
-            return {"tasks": [task], "next_cursor": None}
-
-        async def get_task(self, task_id):
-            assert task_id == task["id"]
-            return {"task": task, "questions": []}
-
-        async def task_command(self, task_id, action, payload):
-            commands.append((task_id, action))
-            return {**task, "state": "paused"}
+    async def worker(execution):
+        await asyncio.Event().wait()
 
     async def model(request):
         body = await request.json()
@@ -375,7 +367,7 @@ async def test_model_cannot_pause_a_task_without_the_users_explicit_target(monke
         else:
             delta, finish = {"tool_calls": [{"index": 0, "id": f"control-{len(body['messages'])}",
                                              "type": "function", "function": {"name": "task_command",
-                                             "arguments": '{"task_id":"report","action":"pause"}'}}]}, "tool_calls"
+                                             "arguments": json.dumps({"task_id": task_id, "action": "pause"})}}]}, "tool_calls"
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await response.prepare(request)
         chunk = {"id": "model", "object": "chat.completion.chunk", "created": 0, "model": "test",
@@ -390,19 +382,28 @@ async def test_model_cannot_pause_a_task_without_the_users_explicit_target(monke
     await web.TCPSite(server, "127.0.0.1", 0).start()
     monkeypatch.setenv("DEEPSEEK_API_KEY", "task-test-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", f"http://127.0.0.1:{server.addresses[0][1]}")
-    runtime = Runtime(task_factory=lambda store, on_change: TaskService())
+    runtime = Runtime(database_path=path, task_factory=lambda store, on_change: TaskRuntime(
+        store, worker, ActionReconciler(BuiltinTools(applications=None).inspect_action), on_change=on_change,
+    ))
     runtime.start()
     try:
         for instruction in ("只停止当前播报，后台任务继续。", "暂停任务", "先不要暂停生成报告"):
             runtime.send_text(instruction)
             assert (await asyncio.wait_for(results.get(), 5))["status"] == "rejected"
-        assert commands == []
+        assert runtime.get_task(task_id)["task"]["state"] == "running"
         runtime.send_text("请暂停「生成报告」。")
-        assert (await asyncio.wait_for(results.get(), 5))["task"]["state"] == "paused"
-        assert commands == [("report", "pause")]
+        result = await asyncio.wait_for(results.get(), 5)
+        assert result["task"]["state"] in {"pausing", "paused"}, result
+        assert runtime.get_task(task_id)["task"]["stop_intent"] == "pause"
     finally:
         await asyncio.to_thread(runtime.stop)
         await server.cleanup()
+
+
+def test_chat_replacement_path_keeps_user_punctuation(tmp_path):
+    path = str(tmp_path / "报告!")
+    _, answer = task_command_intent("answer", f"回答生成报告：{path}", {"id": "report", "title": "生成报告"})
+    assert replacement_file_scope(answer)["target"] == path
 
 
 def test_task_detail_reply_can_authorize_the_replacement_file(tmp_path):
