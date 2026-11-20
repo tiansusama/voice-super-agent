@@ -24,7 +24,6 @@ class TaskSource(TypedDict):
 class ScopeGrant(TypedDict):
     operation: Operation
     target: str
-    recursive: NotRequired[bool]
 
 
 class TaskPlan(TypedDict):
@@ -154,9 +153,6 @@ class ExecutionAccess(Protocol):
     async def finish_action(self, step_id: str, result: ActionResult) -> None: ...
 
 
-TaskChangeHandler = Callable[[TaskChange], Awaitable[None]]
-
-
 class TaskRuntimeFault(TypedDict):
     """写入失败时报告内存中的真实结果，区别于已经提交的持久通知。"""
 
@@ -164,6 +160,9 @@ class TaskRuntimeFault(TypedDict):
     task_id: str
     error: str
     known_result: ActionResult | None
+
+
+TaskChangeHandler = Callable[[TaskChange | TaskRuntimeFault], Awaitable[None]]
 
 
 class TaskService(Protocol):
@@ -191,8 +190,6 @@ class TaskService(Protocol):
     async def list_changes(self, after_position: int = 0, limit: int = 50) -> list[TaskChange]: ...
 
     async def mark_read(self, notification_id: str) -> None: ...
-
-    async def next_change(self) -> TaskChange | TaskRuntimeFault: ...
 
     async def request_shutdown(self) -> ShutdownProgress: ...
 

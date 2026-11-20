@@ -3,12 +3,15 @@ from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 import logging
+import json
 from pathlib import Path
 import sqlite3
 from typing import get_args
 from uuid import uuid4
 
 import anyio
+from mcp.shared.exceptions import McpError
+from openai import APIError
 
 from voice_super_agent.memory.store import ConversationStore
 from voice_super_agent.tasks.interface import ActionRequest, ActionResult, Operation, TaskDetail, TaskSource
@@ -33,7 +36,6 @@ class TaskRuntime:
         self._resources: dict[str, str] = {}
         self._running: dict[str, _Execution] = {}
         self._faults: dict[str, TaskDetail] = {}
-        self._events = asyncio.Queue()
         self._shutdown = False
         self._shutdown_error = ""
         self._dispatcher: asyncio.Task | None = None
@@ -106,9 +108,6 @@ class TaskRuntime:
     async def list_changes(self, after_position=0, limit=50):
         return await self._store.list_changes(after_position, limit)
 
-    async def next_change(self):
-        return await self._events.get()
-
     async def mark_read(self, notification_id):
         await self._store.mark_read(notification_id)
 
@@ -122,7 +121,6 @@ class TaskRuntime:
         return await self._store.get_concurrency()
 
     async def _publish(self, change):
-        self._events.put_nowait(change)
         if self._on_change is not None:
             await self._on_change(change)
 
@@ -179,6 +177,10 @@ class TaskRuntime:
                     await self._validate_source(source)
                 item = {"id": uuid4().hex, "kind": action, "source": source, "text": text,
                         "consumed": False, "created_at": datetime.now(timezone.utc).isoformat()}
+                final = next((step for step in reversed(detail["steps"]) if step.get("final")
+                              and step["status"] in {"started", "uncertain", "succeeded"}), None)
+                if final is not None and action == "supplement":
+                    item["after_step"] = final["id"]
                 if action == "answer":
                     question = next((q for q in detail["questions"] if q["id"] == payload["question_id"] and q["status"] == "open"), None)
                     if question is None:
@@ -290,7 +292,7 @@ class TaskRuntime:
             with anyio.CancelScope(shield=True):
                 await execution.settled.wait()
                 await self._submitted(self._finish_stopped(execution))
-        except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        except (RuntimeError, ValueError, OSError, sqlite3.Error, APIError, McpError) as exc:
             if execution.task_id not in self._faults:
                 async with self._lock:
                     detail = await self.get_task(execution.task_id)
@@ -354,7 +356,7 @@ class TaskRuntime:
                 continue
             if request["operation"] in {"file.read", "file.create", "directory.list"}:
                 target, root = Path(request["target"]).resolve(), Path(grant["target"]).resolve()
-                if target == root or grant.get("recursive", False) and target.is_relative_to(root):
+                if target == root:
                     return True
             elif request["target"].casefold() == grant["target"].casefold():
                 return True
@@ -370,9 +372,15 @@ class TaskRuntime:
                 if not self._allowed(detail, request):
                     await self._question(detail, execution.execution_id, f"需要确认新增操作范围：{request['operation']} {request['target']}。")
                     raise PermissionError("工具目标超出用户确认的任务范围。")
+                if execution.model_call_id is not None and execution.pending_inputs(detail):
+                    raise ValueError("新的任务输入已保存，请采用补充后重新安排动作。")
                 if not any(resource in self._resources for resource in request["resources"]):
                     step = {"id": uuid4().hex, "execution_id": execution.execution_id, "request": deepcopy(request),
-                            "status": "started", "outcome": None, "created_at": datetime.now(timezone.utc).isoformat()}
+                            "status": "started", "outcome": None, "final": execution.final_step,
+                            "model_call_id": execution.model_call_id,
+                            "created_at": datetime.now(timezone.utc).isoformat()}
+                    if execution.protocol_request_id is not None:
+                        step["request"]["request_id"] = execution.protocol_request_id
                     detail["steps"].append(step)
                     # 步骤记录与资源占用在取消屏蔽区提交，工具返回许可后才开始真实动作。
                     with anyio.CancelScope(shield=True):
@@ -435,17 +443,21 @@ class TaskRuntime:
             if task["execution_id"] != execution.execution_id:
                 raise ValueError("执行已被替换。")
             if task["stop_intent"] or self._shutdown:
-                return
+                return False
+            if execution.model_call_id is not None and execution.pending_inputs(detail):
+                return False
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("Worker 须提供明确的完成结果。")
             if task["state"] != "running":
                 raise ValueError("任务当前尚待处理，无法提交完成结果。")
             if any(step["status"] in {"started", "uncertain"} for step in detail["steps"]):
                 raise ValueError("实际动作尚未核实，任务保持未完成。")
-            task.update(state="completed", progress="已完成", result=text, error="")
-            changes = [{"kind": "result", "text": text}]
             pending = [item for item in detail["inputs"] if not item["consumed"] and item["kind"] == "supplement"]
             if pending:
-                changes.append({"kind": "supplement", "text": "原结果已经生成，后续补充尚未执行；新增操作请建立关联任务。"})
-            await self._commit(detail, changes)
+                text += "\n原结果已经生成，后续补充尚未执行；新增操作请建立关联任务。"
+            task.update(state="completed", progress="已完成", result=text, error="")
+            await self._commit(detail, [{"kind": "result", "text": text}])
+            return True
 
     async def request_shutdown(self):
         return await self._submitted(self._request_shutdown())
@@ -517,6 +529,9 @@ class _Execution:
         self.task_id = task_id
         self.execution_id = execution_id
         self.current_step = None
+        self.final_step = False
+        self.protocol_request_id = None
+        self.model_call_id = None
         self.recovering_steps = set()
         self.stop_requested = False
         self.settled = asyncio.Event()
@@ -536,6 +551,55 @@ class _Execution:
     async def get_task(self):
         return await self.runtime.get_task(self.task_id)
 
+    @staticmethod
+    def active_inputs(detail):
+        completed = {step["id"] for step in detail["steps"] if step["status"] == "succeeded"}
+        return [item for item in detail["inputs"] if item.get("after_step") not in completed]
+
+    @staticmethod
+    def pending_inputs(detail):
+        return [item for item in _Execution.active_inputs(detail) if not item["consumed"]]
+
+    async def record_model(self, messages, consumed=()):
+        async with self.runtime._lock:
+            detail = await self.get_task()
+            if detail["task"]["execution_id"] != self.execution_id or detail["task"]["state"] != "running":
+                raise asyncio.CancelledError()
+            record = next(record for record in detail["executions"] if record["id"] == self.execution_id)
+            record["messages"] = deepcopy(messages)
+            for item in detail["inputs"]:
+                if item["id"] in consumed:
+                    item["consumed"] = True
+            await self.runtime._commit(detail, [])
+            return bool(self.pending_inputs(detail))
+
+    async def read(self, kind, identifier, section="task", offset=0, limit=2000):
+        """只按任务关系与明确引用回读，正文按字符分页。"""
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 4000:
+            raise ValueError("回读偏移须为非负整数，每次 1～4000 字符。")
+        detail = await self.get_task()
+        if kind == "task":
+            if identifier not in {self.task_id, detail["related_task_id"], *detail["references"]}:
+                raise PermissionError("仅能读取本任务、关联任务及明确引用的任务。")
+            if section not in {"task", "scope", "inputs", "steps", "executions", "questions", "artifacts"}:
+                raise ValueError("任务回读部分无效。")
+            target = await self.runtime.get_task(identifier)
+            text = json.dumps(target[section], ensure_ascii=False)
+        elif kind == "history":
+            def read(connection):
+                row = connection.execute("SELECT id, reply_id, text FROM display_messages WHERE id = ?", (identifier,)).fetchone()
+                if row is None:
+                    raise ValueError("引用消息不存在。")
+                if row["reply_id"] != detail["task"]["source"]["reply_id"] and identifier not in detail["references"]:
+                    raise PermissionError("仅能读取来源对话及明确引用的消息。")
+                return row["text"]
+            text = await self.runtime._conversation_store.task_io(read)
+        else:
+            raise ValueError("回读类型须为 task 或 history。")
+        end = offset + limit
+        return {"id": identifier, "text": text[offset:end], "total_characters": len(text),
+                "next_offset": end if end < len(text) else None}
+
     async def ask(self, text):
         async with self.runtime._lock:
             detail = await self.get_task()
@@ -544,4 +608,4 @@ class _Execution:
             await self.runtime._question(detail, self.execution_id, text)
 
     async def complete(self, text):
-        await self.runtime._complete(self, text)
+        return await self.runtime._complete(self, text)
