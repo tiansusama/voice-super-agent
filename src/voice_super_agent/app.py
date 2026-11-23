@@ -23,16 +23,22 @@ DEV_URL = "http://127.0.0.1:5178"
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
+def main(*, app_root: Path | None = None, user_dir: Path | None = None) -> None:
     """桌面负责窗口生命周期，后台循环持续运行到用户明确退出。"""
     parser = argparse.ArgumentParser(description="启动小博桌面应用")
     parser.add_argument("--dev", action="store_true", help="加载本地 Vite 开发服务")
     parser.add_argument("--desktop-check", action="store_true", help="显示窗口与持续推送的开发联调入口")
+    if user_dir is not None:
+        parser.add_argument("--configure", action="store_true", help="重新配置本机服务密钥")
     args = parser.parse_args()
+    if app_root is None:
+        app_root = PROJECT_ROOT
 
     instance = SingleInstance()
     try:
         if not instance.primary:
+            if user_dir is not None and args.configure:
+                raise ValueError("请先从系统托盘退出小博，再打开“配置小博”。")
             instance.notify()
             print("应用已运行，正在显示已有主窗口。")
             return
@@ -44,15 +50,20 @@ def main() -> None:
                 parser.error(f"无法连接 {DEV_URL}，请先运行 npm --prefix frontend run dev：{exc}")
             page = DEV_URL
         else:
-            index_path = PROJECT_ROOT / "frontend" / "dist" / "index.html"
+            index_path = app_root / "frontend" / "dist" / "index.html"
             if not index_path.is_file():
                 parser.error("缺少前端构建产物，请先运行 npm --prefix frontend run build")
             page = str(index_path)
 
-        load_dotenv(PROJECT_ROOT / ".env", encoding="utf-8-sig")
-        local_dir = PROJECT_ROOT / ".local"
+        local_dir = user_dir if user_dir is not None else app_root / ".local"
+        env_path = (user_dir if user_dir is not None else app_root) / ".env"
         for directory in ("data", "logs", "webview"):
             (local_dir / directory).mkdir(parents=True, exist_ok=True)
+        if user_dir is not None and (args.configure or not env_path.is_file()):
+            from voice_super_agent.desktop.setup import configure_services
+
+            configure_services(env_path)
+        load_dotenv(env_path, encoding="utf-8-sig", override=user_dir is not None, interpolate=user_dir is None)
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -71,7 +82,7 @@ def main() -> None:
                                        on_change=on_change)
 
         runtime = Runtime(desktop_check=args.desktop_check, database_path=local_dir / "data" / "agent.sqlite3",
-                          wake_model_dir=PROJECT_ROOT / "resources" / "models" / MODEL_NAME,
+                          wake_model_dir=app_root / "resources" / "models" / MODEL_NAME,
                           task_factory=task_factory)
         desktop = Desktop(runtime, page)
         try:

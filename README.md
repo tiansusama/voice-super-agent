@@ -6,6 +6,8 @@
 
 ## 在 Windows 上开始使用
 
+Windows 11 x64 安装原型和首次启动配置见[安装说明](docs/windows-installation.md)。
+
 先准备 Git、uv、Node.js/npm 和 WebView2，具体版本及安装入口见[环境说明](docs/development.md#1-环境)。克隆后双击根目录的 **`start.cmd`**。
 
 启动准备窗口会显示四步进度：Python 环境、界面依赖、界面构建和唤醒模型。缺少的项目依赖和模型自动下载；首次生成 `.env`，已有配置继续保留。服务密钥需要自行填写本地 `.env` 并重启；只填写 DeepSeek Key 即可文字对话。应用已运行时，重复双击直接唤出原窗口。
